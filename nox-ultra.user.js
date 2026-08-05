@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.5-ultra';
+    var SCRIPT_VERSION = '1.6-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -240,6 +240,9 @@
     var ULTRA_PLATFORM_NAME = { 1: 'YouTube', 6: 'Instagram', 10: 'TikTok' };
     // 跨平台跑的顺序:每批词依次在这三个平台各搜一次并收藏(共用同一套词/筛选/当天收藏夹)
     var ULTRA_PLATFORM_ORDER = [1, 6, 10];
+    // 【测试模式】每个平台最多收多少个达人就切下一个(设为 0 表示不限,收满整批)。
+    // 先用小值验证三平台都能正常抓取;确认没问题后改回 0 即可跑完整流程。
+    var ULTRA_PER_PLATFORM_LIMIT = 20;
     function ultraBuildUrl(template, words, platform) {
         var obj = JSON.parse(JSON.stringify(template));
         var excludes = (obj.wordsList || []).filter(function (w) { return w.exclude === 1; });
@@ -375,18 +378,20 @@
         }
         if (count == null) {
             ultraStatus('读不到结果数,按“够一批”处理,进入收藏');
-            st.phase = 'collect'; st.folders = null; st.folderIdx = 0; ultraSaveState(st);
+            st.phase = 'collect'; st.folders = null; st.folderIdx = 0; st.platformCollected = 0; ultraSaveState(st);
             return ultraDoCollect(st);
         }
         ultraStatus('当前批 [' + st.batchWords.join(' + ') + '] 结果约 ' + count + ' 条');
         var maxWords = st.maxWords || 20;
+        // 测试模式:每平台只收少量,不需要累加词凑大结果集,单词直接定批
+        var testMode = ULTRA_PER_PLATFORM_LIMIT > 0;
         // 已到搜索框词数上限,不能再加了 → 直接定批
-        if (count >= st.target || st.remainingWords.length === 0 || st.batchWords.length >= maxWords) {
+        if (testMode || count >= st.target || st.remainingWords.length === 0 || st.batchWords.length >= maxWords) {
             if (st.batchWords.length >= maxWords && count < st.target) {
                 ultraStatus('已达搜索框 ' + maxWords + ' 词上限,直接定批收藏');
             }
             // 定批,进入收藏
-            st.phase = 'collect'; st.folders = null; st.folderIdx = 0; ultraSaveState(st);
+            st.phase = 'collect'; st.folders = null; st.folderIdx = 0; st.platformCollected = 0; ultraSaveState(st);
             await sleepPlain(600);
             return ultraDoCollect(st);
         }
@@ -412,6 +417,8 @@
                 return;
             }
         }
+        // 本平台本批已收数(测试模式用:到上限就切下一平台)。每次进入 collect(即每个平台)从 0 起。
+        if (st.platformCollected == null) { st.platformCollected = 0; ultraSaveState(st); }
         var pageNum = 0;
         while (true) {
             // 每轮开头重读状态:用户点“停止”会把 running 置 false / 清空,这里要能立刻退出
@@ -437,58 +444,78 @@
                 if (ids.length) {
                     var room = folder.cap - folder.filled;
                     if (ids.length > room) ids = ids.slice(0, room);
-                    var r = await collectViaApi(ids, [folder.id], st.platform);
-                    if (r.status !== 200) {
-                        ultraStatus('收藏接口返回 ' + r.status + ',暂停。请检查登录/收藏夹。');
-                        st.running = false; ultraSaveState(st);
-                        alert('全自动暂停:收藏接口返回 ' + r.status + '。请检查登录状态后重试。');
-                        return;
+                    // 测试模式:本平台最多收 ULTRA_PER_PLATFORM_LIMIT 个
+                    if (ULTRA_PER_PLATFORM_LIMIT > 0) {
+                        var platRoom = ULTRA_PER_PLATFORM_LIMIT - st.platformCollected;
+                        if (ids.length > platRoom) ids = ids.slice(0, platRoom);
                     }
-                    folder.filled += ids.length;
-                    st.stats.collected += ids.length;
-                    ultraSaveState(st);
+                    if (ids.length) {
+                        var r = await collectViaApi(ids, [folder.id], st.platform);
+                        if (r.status !== 200) {
+                            ultraStatus('收藏接口返回 ' + r.status + ',暂停。请检查登录/收藏夹。');
+                            st.running = false; ultraSaveState(st);
+                            alert('全自动暂停:收藏接口返回 ' + r.status + '。请检查登录状态后重试。');
+                            return;
+                        }
+                        folder.filled += ids.length;
+                        st.stats.collected += ids.length;
+                        st.platformCollected += ids.length;
+                        ultraSaveState(st);
+                    }
+                }
+                // 测试模式:本平台已达上限,当作“本平台本批收完”,走切平台逻辑
+                if (ULTRA_PER_PLATFORM_LIMIT > 0 && st.platformCollected >= ULTRA_PER_PLATFORM_LIMIT) {
+                    ultraStatus('批' + (st.stats.batches + 1) + ' 在 ' + (ULTRA_PLATFORM_NAME[st.platform] || st.platform) + ' 已收满 ' + ULTRA_PER_PLATFORM_LIMIT + ' 个(测试上限)。');
+                    if (await ultraAdvancePlatformOrBatch(st)) return;
+                    return;
                 }
             }
             // 翻页
             var hasNext = await goToNextPage();
             if (!hasNext) {
-                // 当前平台本批已到最后一页
-                var order = st.platformOrder || [st.platform];
                 var curName = ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform);
                 ultraStatus('批' + (st.stats.batches + 1) + ' 在 ' + curName + ' 已到最后一页。');
-                // 还有下一个平台:同一批词换平台继续收(共用同一批收藏夹,不重置 folders)
-                if (st.platformIdx + 1 < order.length) {
-                    st.platformIdx++;
-                    st.platform = order[st.platformIdx];
-                    var nextName = ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform);
-                    st.phase = 'collect'; // 词已定,换平台直接收藏,不再 probe
-                    ultraSaveState(st);
-                    ultraStatus('批' + (st.stats.batches + 1) + ' 切到 ' + nextName + ' 继续收藏…');
-                    await sleepPlain(600);
-                    location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
-                    return;
-                }
-                // 三平台都跑完:本批完成
-                st.stats.batches++;
-                ultraStatus('批' + st.stats.batches + ' 三平台全部完成。');
-                if (st.remainingWords.length === 0) {
-                    st.running = false; ultraSaveState(st);
-                    ultraStatus('全部完成!共收藏 ' + st.stats.collected + ' 个,跑了 ' + st.stats.batches + ' 批。');
-                    alert('全自动完成!\n共收藏 ' + st.stats.collected + ' 个达人,' + st.stats.batches + ' 批(每批 YouTube/Instagram/TikTok 三平台)。');
-                    return;
-                }
-                // 下一批:回到第一个平台重新 probe,取下一个词起头
-                st.phase = 'probe';
-                st.platformIdx = 0;
-                st.platform = order[0];
-                st.batchWords = [st.remainingWords.shift()];
-                ultraSaveState(st);
-                await sleepPlain(600);
-                location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
+                await ultraAdvancePlatformOrBatch(st);
                 return;
             }
             await sleep(NEXT_PAGE_WAIT_TIME);
         }
+    }
+    // 当前平台本批收完(到平台上限 / 翻到最后一页):切下一平台;三平台都完了就进下一批词。
+    async function ultraAdvancePlatformOrBatch(st) {
+        var order = st.platformOrder || [st.platform];
+        // 还有下一个平台:同一批词换平台继续收(共用同一批收藏夹,不重置 folders)
+        if (st.platformIdx + 1 < order.length) {
+            st.platformIdx++;
+            st.platform = order[st.platformIdx];
+            st.platformCollected = 0; // 新平台从 0 计数
+            st.phase = 'collect'; // 词已定,换平台直接收藏,不再 probe
+            ultraSaveState(st);
+            var nextName = ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform);
+            ultraStatus('批' + (st.stats.batches + 1) + ' 切到 ' + nextName + ' 继续收藏…');
+            await sleepPlain(600);
+            location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
+            return true;
+        }
+        // 三平台都跑完:本批完成
+        st.stats.batches++;
+        ultraStatus('批' + st.stats.batches + ' 三平台全部完成。');
+        if (st.remainingWords.length === 0) {
+            st.running = false; ultraSaveState(st);
+            ultraStatus('全部完成!共收藏 ' + st.stats.collected + ' 个,跑了 ' + st.stats.batches + ' 批。');
+            alert('全自动完成!\n共收藏 ' + st.stats.collected + ' 个达人,' + st.stats.batches + ' 批(每批 YouTube/Instagram/TikTok 三平台)。');
+            return true;
+        }
+        // 下一批:回到第一个平台重新 probe,取下一个词起头
+        st.phase = 'probe';
+        st.platformIdx = 0;
+        st.platform = order[0];
+        st.platformCollected = 0;
+        st.batchWords = [st.remainingWords.shift()];
+        ultraSaveState(st);
+        await sleepPlain(600);
+        location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
+        return true;
     }
     function stopUltra() {
         var st = ultraLoadState();
