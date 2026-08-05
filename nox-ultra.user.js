@@ -1,13 +1,9 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      2.0
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
-// @match        https://cn.noxinfluencer.com/search/*
-// @match        https://cn.noxinfluencer.com/lookalike/*
-// @match        https://cn.noxinfluencer.com/resource-folder/*
-// @match        https://cn.noxinfluencer.com/email/*
-// @match        https://cn.noxinfluencer.com/crm-detail/*
+// @match        https://cn.noxinfluencer.com/*
 // @grant        none
 // @run-at       document-end
 // @require      https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js
@@ -18,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.9-ultra';
+    var SCRIPT_VERSION = '2.0-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -651,11 +647,17 @@
     function isFolderPage() { return location.href.indexOf('/resource-folder/') !== -1; }
     function isEmailPage() { return location.href.indexOf('/email/') !== -1; }
     function isCrmPage() { return location.href.indexOf('/crm-detail/') !== -1; }
+    // 精确判断:是不是真正的搜索结果页(/search/xxx/channel)。全自动只在这种页跑。
+    function isSearchResultPage() { return /\/search\/[^\/]+\/channel/.test(location.pathname); }
     function currentPageType() {
         if (isFolderPage()) return 'folder';
         if (isEmailPage()) return 'email';
         if (isCrmPage()) return 'crm';
         return 'search';
+    }
+    // 是不是脚本要挂面板的功能页。全站加载后,首页等非功能页不建面板(避免到处弹浮窗)。
+    function isPanelPage() {
+        return isSearchResultPage() || isFolderPage() || isEmailPage() || isCrmPage();
     }
     var LS_CODES = 'nox-folder-codes';
     var folderStopRequested = false;
@@ -2022,6 +2024,7 @@
         root.appendChild(crmStatusEl);
     }
     function ensureUI() {
+        if (!isPanelPage()) return; // 非功能页不建面板
         if (document.body) { initializeControls(); }
         else { setTimeout(ensureUI, 500); }
     }
@@ -2030,9 +2033,14 @@
     //  - 任务进行中的正常重载(翻页/跳新词URL):状态是刚存的(60秒内)→ 无声续跑
     //  - 旧的残留状态(关了浏览器过一阵、或上次没停干净):状态陈旧 → 先弹确认,别闷头自己跑
     function ultraAutoResume() {
-        if (currentPageType() !== 'search') return;
         var st = ultraLoadState();
         if (!st || !st.running) return;
+        // 被人机验证/意外跳转甩到了非搜索结果页(首页等):任务状态还在,只是页面不对。
+        // 显示倒计时提示条,自动跳回该批词应在的搜索 URL 续跑。
+        if (!isSearchResultPage()) {
+            ultraShowRecoveryBar(st);
+            return;
+        }
         var age = Date.now() - (st._ts || 0);
         if (age <= 60000) {
             // 新鲜:任务正在跑的正常重载,直接续
@@ -2051,9 +2059,43 @@
             }, 1500);
         }
     }
+    // 被甩出搜索页时的恢复提示条:倒计时后自动跳回该批词的搜索 URL。可点“留在本页”取消。
+    function ultraShowRecoveryBar(st) {
+        if (document.getElementById('nox-ultra-recovery')) return;
+        var targetUrl;
+        try { targetUrl = ultraBuildUrl(st.template, st.batchWords, st.platform); }
+        catch (e) { console.log('[ultra] 重建续跑URL失败:', e && e.message); return; }
+        var secs = 5, cancelled = false;
+        var bar = document.createElement('div');
+        bar.id = 'nox-ultra-recovery';
+        bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#7c3aed;color:#fff;padding:12px 16px;font-size:14px;font-weight:bold;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.3);';
+        var span = document.createElement('span');
+        var btnGo = document.createElement('button');
+        btnGo.textContent = '立即继续';
+        btnGo.style.cssText = 'margin-left:12px;padding:4px 10px;background:#fff;color:#7c3aed;border:none;border-radius:4px;cursor:pointer;font-weight:bold;';
+        btnGo.addEventListener('click', function () { cancelled = true; location.href = targetUrl; });
+        var btnStay = document.createElement('button');
+        btnStay.textContent = '留在本页';
+        btnStay.style.cssText = 'margin-left:8px;padding:4px 10px;background:transparent;color:#fff;border:1px solid #fff;border-radius:4px;cursor:pointer;';
+        btnStay.addEventListener('click', function () { cancelled = true; bar.remove(); });
+        function render() {
+            span.textContent = '⚠️ 全自动任务被中断(已收藏 ' + (st.stats ? st.stats.collected : 0) + ' 个)。' + secs + ' 秒后自动跳回继续…';
+        }
+        render();
+        bar.appendChild(span); bar.appendChild(btnGo); bar.appendChild(btnStay);
+        (document.body || document.documentElement).appendChild(bar);
+        var timer = setInterval(function () {
+            if (cancelled) { clearInterval(timer); return; }
+            secs--;
+            if (secs <= 0) { clearInterval(timer); location.href = targetUrl; return; }
+            render();
+        }, 1000);
+    }
     setInterval(function () {
         if (!document.body) return;
         var existing = document.getElementById('nox-script-ui');
+        // 非功能页(首页等):不建面板,已有的也移除
+        if (!isPanelPage()) { if (existing) existing.remove(); return; }
         if (!existing) { initializeControls(); return; }
         var want = currentPageType();
         if (existing.getAttribute('data-page') !== want && !folderRunning && !isScriptRunning && !emailRunning && !crmRunning) {
