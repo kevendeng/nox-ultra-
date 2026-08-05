@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.6-ultra';
+    var SCRIPT_VERSION = '1.7-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -240,9 +240,9 @@
     var ULTRA_PLATFORM_NAME = { 1: 'YouTube', 6: 'Instagram', 10: 'TikTok' };
     // 跨平台跑的顺序:每批词依次在这三个平台各搜一次并收藏(共用同一套词/筛选/当天收藏夹)
     var ULTRA_PLATFORM_ORDER = [1, 6, 10];
-    // 【测试模式】每个平台最多收多少个达人就切下一个(设为 0 表示不限,收满整批)。
-    // 先用小值验证三平台都能正常抓取;确认没问题后改回 0 即可跑完整流程。
-    var ULTRA_PER_PLATFORM_LIMIT = 20;
+    // 每个平台最多收多少个达人就切下一个(设为 0 表示不限,收满整批直到翻完最后一页或收藏夹满)。
+    // >0 为测试模式:每平台只收这么多、且 probe 单词即定批,用于快速验证三平台抓取。
+    var ULTRA_PER_PLATFORM_LIMIT = 0;
     function ultraBuildUrl(template, words, platform) {
         var obj = JSON.parse(JSON.stringify(template));
         var excludes = (obj.wordsList || []).filter(function (w) { return w.exclude === 1; });
