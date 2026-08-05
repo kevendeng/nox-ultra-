@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.4-ultra';
+    var SCRIPT_VERSION = '1.5-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -237,6 +237,9 @@
     // 用模板对象 + 一组搜索词 + 平台,生成完整搜索页 URL。
     // words = 搜索词数组(exclude:0);模板里原有的排除词(exclude:1)保留。
     var ULTRA_PLATFORM_PATH = { 1: 'youtube', 6: 'instagram', 10: 'tiktok' };
+    var ULTRA_PLATFORM_NAME = { 1: 'YouTube', 6: 'Instagram', 10: 'TikTok' };
+    // 跨平台跑的顺序:每批词依次在这三个平台各搜一次并收藏(共用同一套词/筛选/当天收藏夹)
+    var ULTRA_PLATFORM_ORDER = [1, 6, 10];
     function ultraBuildUrl(template, words, platform) {
         var obj = JSON.parse(JSON.stringify(template));
         var excludes = (obj.wordsList || []).filter(function (w) { return w.exclude === 1; });
@@ -326,12 +329,14 @@
         }
         var capInfo = matched.map(function (f) { return f.name + '(' + f.filled + '/' + f.cap + ')'; }).join('\n');
         if (!confirm('找到 ' + matched.length + ' 个收藏夹,将按此顺序依次填满:\n' + capInfo + '\n\n关键词 ' + words.length + ' 个,每批目标 ' + target + '。开始吗?')) return;
-        var platform = getPlatformFromUrl();
         // 搜索框最多 20 个词(含排除词)。正常词能加的上限 = 20 - 模板里已有的排除词数。
         var excludeCount = ((template.wordsList || []).filter(function (w) { return w.exclude === 1; })).length;
         var maxWords = Math.max(1, 20 - excludeCount);
+        // 每批词跑三平台:probe 用第一个平台(YouTube)定批,collect 依次在三平台各收一次
+        var platformOrder = ULTRA_PLATFORM_ORDER.slice();
         var st = {
-            running: true, platform: platform, template: template,
+            running: true, platform: platformOrder[0], template: template,
+            platformOrder: platformOrder, platformIdx: 0,
             remainingWords: words.slice(1), batchWords: [words[0]],
             target: target, prefix: prefix, maxWords: maxWords,
             phase: 'probe', folders: null, folderIdx: 0,
@@ -339,7 +344,7 @@
         };
         ultraSaveState(st);
         ultraStatus('开始,第1批探测:' + st.batchWords.join(' + '));
-        location.href = ultraBuildUrl(template, st.batchWords, platform);
+        location.href = ultraBuildUrl(template, st.batchWords, st.platform);
     }
     // 页面加载后驱动:根据 state.phase 继续。改URL会重载,所以每次加载都要 tick 一次。
     async function ultraTick() {
@@ -447,17 +452,35 @@
             // 翻页
             var hasNext = await goToNextPage();
             if (!hasNext) {
-                // 本批到最后一页:结束本批,开下一批(或全部结束)
-                ultraStatus('批' + (st.stats.batches + 1) + ' 已到最后一页,本批完成。');
+                // 当前平台本批已到最后一页
+                var order = st.platformOrder || [st.platform];
+                var curName = ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform);
+                ultraStatus('批' + (st.stats.batches + 1) + ' 在 ' + curName + ' 已到最后一页。');
+                // 还有下一个平台:同一批词换平台继续收(共用同一批收藏夹,不重置 folders)
+                if (st.platformIdx + 1 < order.length) {
+                    st.platformIdx++;
+                    st.platform = order[st.platformIdx];
+                    var nextName = ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform);
+                    st.phase = 'collect'; // 词已定,换平台直接收藏,不再 probe
+                    ultraSaveState(st);
+                    ultraStatus('批' + (st.stats.batches + 1) + ' 切到 ' + nextName + ' 继续收藏…');
+                    await sleepPlain(600);
+                    location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
+                    return;
+                }
+                // 三平台都跑完:本批完成
                 st.stats.batches++;
+                ultraStatus('批' + st.stats.batches + ' 三平台全部完成。');
                 if (st.remainingWords.length === 0) {
                     st.running = false; ultraSaveState(st);
                     ultraStatus('全部完成!共收藏 ' + st.stats.collected + ' 个,跑了 ' + st.stats.batches + ' 批。');
-                    alert('全自动完成!\n共收藏 ' + st.stats.collected + ' 个达人,' + st.stats.batches + ' 批。');
+                    alert('全自动完成!\n共收藏 ' + st.stats.collected + ' 个达人,' + st.stats.batches + ' 批(每批 YouTube/Instagram/TikTok 三平台)。');
                     return;
                 }
-                // 下一批:重置为 probe,取下一个词起头
+                // 下一批:回到第一个平台重新 probe,取下一个词起头
                 st.phase = 'probe';
+                st.platformIdx = 0;
+                st.platform = order[0];
                 st.batchWords = [st.remainingWords.shift()];
                 ultraSaveState(st);
                 await sleepPlain(600);
