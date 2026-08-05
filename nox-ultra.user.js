@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.3-ultra';
+    var SCRIPT_VERSION = '1.4-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -263,7 +263,7 @@
         try { return JSON.parse(localStorage.getItem(ULTRA_LS) || 'null'); } catch (e) { return null; }
     }
     function ultraSaveState(st) {
-        try { localStorage.setItem(ULTRA_LS, JSON.stringify(st)); } catch (e) {}
+        try { if (st) st._ts = Date.now(); localStorage.setItem(ULTRA_LS, JSON.stringify(st)); } catch (e) {}
     }
     function ultraClearState() {
         try { localStorage.removeItem(ULTRA_LS); } catch (e) {}
@@ -1895,11 +1895,29 @@
         else { setTimeout(ensureUI, 500); }
     }
     // 页面加载后,若有进行中的全自动任务,自动续跑(只在搜索页)。延迟等页面渲染。
+    // 区分两种情况:
+    //  - 任务进行中的正常重载(翻页/跳新词URL):状态是刚存的(60秒内)→ 无声续跑
+    //  - 旧的残留状态(关了浏览器过一阵、或上次没停干净):状态陈旧 → 先弹确认,别闷头自己跑
     function ultraAutoResume() {
         if (currentPageType() !== 'search') return;
         var st = ultraLoadState();
-        if (st && st.running) {
+        if (!st || !st.running) return;
+        var age = Date.now() - (st._ts || 0);
+        if (age <= 60000) {
+            // 新鲜:任务正在跑的正常重载,直接续
             setTimeout(function () { ultraTick(); }, 2000);
+        } else {
+            // 陈旧:问用户要不要继续,不要一刷新就自动收藏
+            setTimeout(function () {
+                var msg = '检测到一个未完成的全自动任务(已收藏 ' + (st.stats ? st.stats.collected : 0) + ' 个)。\n\n点“确定”继续跑,点“取消”结束并清理。';
+                if (confirm(msg)) {
+                    ultraSaveState(st); // 刷新时间戳
+                    ultraTick();
+                } else {
+                    stopUltra();
+                    ultraStatus('已结束上次的残留任务。');
+                }
+            }, 1500);
         }
     }
     setInterval(function () {
