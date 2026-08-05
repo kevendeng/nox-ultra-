@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.8-ultra';
+    var SCRIPT_VERSION = '1.9-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -350,13 +350,10 @@
         // 用前缀作过滤词,把当天收藏夹显示出来
         if (groupFilterInput) groupFilterInput.value = info.prefix;
         if (__noxGroupCache) populateGroupOptions(__noxGroupCache, info.prefix);
-        // 全选匹配到的这些
+        // 勾选匹配到的这些(其余不勾)
         var matchIds = {};
         matched.forEach(function (f) { matchIds[String(f.id)] = 1; });
-        for (var i = 0; i < groupSelectEl.options.length; i++) {
-            var o = groupSelectEl.options[i];
-            o.selected = !!matchIds[o.value];
-        }
+        eachGroupCheckbox(function (cb) { cb.checked = !!matchIds[cb.value]; });
         syncSelectedGroups();
         ultraPending = info;
         ultraStatus('已列出 ' + matched.length + ' 个收藏夹并全选。取消掉不要的,再点“✅ 确认开始”。');
@@ -839,7 +836,7 @@
         startButton.disabled = running;
         stopButton.style.display = running ? 'block' : 'none';
         limitInput.disabled = running;
-        if (groupSelectEl) groupSelectEl.disabled = running;
+        if (groupSelectEl) { groupSelectEl.style.opacity = running ? '0.5' : '1'; groupSelectEl.style.pointerEvents = running ? 'none' : 'auto'; }
         if (groupFilterInput) groupFilterInput.disabled = running;
         if (groupRefreshBtn) groupRefreshBtn.disabled = running;
         if (!running) {
@@ -954,22 +951,41 @@
         selectedGroups.forEach(function (g) { prevSel[g.id] = 1; });
         groupSelectEl.innerHTML = '';
         shown.forEach(function (g) {
-            var opt = document.createElement('option');
-            opt.value = String(g.id);
-            opt.textContent = g.name + '  (已装' + (g.filled != null ? g.filled : '?') + '人)';
-            opt._group = g;
-            if (prevSel[g.id]) opt.selected = true;
-            groupSelectEl.appendChild(opt);
+            var row = document.createElement('label');
+            row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 6px;cursor:pointer;border-bottom:1px solid #f0f0f0;';
+            row.addEventListener('mouseenter', function () { row.style.background = '#f5f5f5'; });
+            row.addEventListener('mouseleave', function () { row.style.background = '#fff'; });
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = String(g.id);
+            cb.checked = !!prevSel[g.id];
+            cb._group = g;
+            cb.style.cssText = 'margin:0;flex:0 0 auto;';
+            cb.addEventListener('change', syncSelectedGroups);
+            var txt = document.createElement('span');
+            txt.textContent = g.name + '  (已装' + (g.filled != null ? g.filled : '?') + '人)';
+            txt.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+            row.appendChild(cb);
+            row.appendChild(txt);
+            groupSelectEl.appendChild(row);
         });
         if (groupSelectedLabel) groupSelectedLabel.textContent = '';
     }
+    // 遍历列表里的复选框
+    function eachGroupCheckbox(fn) {
+        if (!groupSelectEl) return;
+        var cbs = groupSelectEl.querySelectorAll('input[type=checkbox]');
+        for (var i = 0; i < cbs.length; i++) fn(cbs[i], i);
+    }
+    function setAllGroupChecks(checked) {
+        eachGroupCheckbox(function (cb) { cb.checked = checked; });
+        syncSelectedGroups();
+    }
     function syncSelectedGroups() {
         selectedGroups = [];
-        if (!groupSelectEl) return;
-        for (var i = 0; i < groupSelectEl.options.length; i++) {
-            var o = groupSelectEl.options[i];
-            if (o.selected && o._group) selectedGroups.push({ id: o._group.id, name: o._group.name });
-        }
+        eachGroupCheckbox(function (cb) {
+            if (cb.checked && cb._group) selectedGroups.push({ id: cb._group.id, name: cb._group.name });
+        });
         try { localStorage.setItem('nox-collect-group-ids', JSON.stringify(selectedGroups.map(function (g) { return g.id; }))); } catch (e) {}
     }
     async function loadGroupsIntoPanel(force) {
@@ -1039,12 +1055,24 @@
         groupRefreshBtn.addEventListener('click', function () { loadGroupsIntoPanel(true); });
         filterRow.appendChild(groupFilterInput);
         filterRow.appendChild(groupRefreshBtn);
-        // 多选下拉
-        groupSelectEl = document.createElement('select');
-        groupSelectEl.multiple = true;
-        groupSelectEl.size = 6;
-        groupSelectEl.style.cssText = 'width:100%;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:12px;box-sizing:border-box;';
-        groupSelectEl.addEventListener('change', syncSelectedGroups);
+        // 全选 / 全不选 一行
+        var selRow = document.createElement('div');
+        selRow.style.cssText = 'display:flex;gap:10px;font-size:11px;';
+        var selAll = document.createElement('a');
+        selAll.textContent = '全选';
+        selAll.href = 'javascript:void(0)';
+        selAll.style.cssText = 'color:#4CAF50;text-decoration:none;cursor:pointer;';
+        selAll.addEventListener('click', function () { setAllGroupChecks(true); });
+        var selNone = document.createElement('a');
+        selNone.textContent = '全不选';
+        selNone.href = 'javascript:void(0)';
+        selNone.style.cssText = 'color:#888;text-decoration:none;cursor:pointer;';
+        selNone.addEventListener('click', function () { setAllGroupChecks(false); });
+        selRow.appendChild(selAll);
+        selRow.appendChild(selNone);
+        // 复选框列表容器(每行一个收藏夹 + 真复选框)
+        groupSelectEl = document.createElement('div');
+        groupSelectEl.style.cssText = 'width:100%;max-height:150px;overflow-y:auto;border:1px solid #ccc;border-radius:4px;font-size:12px;box-sizing:border-box;background:#fff;';
         groupSelectedLabel = document.createElement('div');
         groupSelectedLabel.style.cssText = 'font-size:11px;color:#888;';
         groupSelectedLabel.textContent = '正在加载收藏夹…';
@@ -1080,6 +1108,7 @@
         root.appendChild(divider);
         root.appendChild(groupLabel);
         root.appendChild(filterRow);
+        root.appendChild(selRow);
         root.appendChild(groupSelectEl);
         root.appendChild(groupSelectedLabel);
         var label = document.createElement('span');
