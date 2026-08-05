@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.7-ultra';
+    var SCRIPT_VERSION = '1.8-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -169,6 +169,9 @@
     var collectPlatform = 6;
     // 已选收藏夹:{id, name} 数组，由下拉多选维护
     var selectedGroups = [];
+    // 全自动“选取收藏夹”待确认态:收集完输入后,等用户在多选框里取消不要的,再点确认开跑
+    var ultraPending = null;
+    var ultraConfirmBtn = null;
     async function startBatchProcess() {
         if (isScriptRunning) return;
         var userLimit = parseInt(limitInput.value, 10);
@@ -283,7 +286,8 @@
     }
     // 从收藏夹全量里,挑出名字以今天前缀开头的,按创建时间正序(旧在前,依次填满)。
     // 名字含字母 m -> 上限 500,其余 -> 1000。返回 [{id,name,cap,filled}...]
-    function ultraPickTodayFolders(groups, prefix) {
+    // allowIds:可选的 id 白名单(数组或对象)。传了就只保留其中的收藏夹(用于用户手动取消了一部分)。
+    function ultraPickTodayFolders(groups, prefix, allowIds) {
         var pfx = prefix || ultraTodayPrefix();
         // 只在最新建的前 100 个收藏夹里找,排除掉去年同前缀(如去年 0806)的老夹子。
         // groups 按创建时间倒序(最新在前),取前 100 即最近建的。
@@ -291,6 +295,12 @@
         var todays = recent.filter(function (g) { return (g.name || '').indexOf(pfx) === 0; });
         // 反转成正序(先建的先填)
         todays = todays.slice().reverse();
+        // 白名单过滤:只留用户勾选的
+        if (allowIds) {
+            var allow = {};
+            (Array.isArray(allowIds) ? allowIds : Object.keys(allowIds)).forEach(function (id) { allow[String(id)] = 1; });
+            todays = todays.filter(function (g) { return allow[String(g.id)]; });
+        }
         return todays.map(function (g) {
             var cap = /m/i.test(g.name || '') ? 500 : 1000;
             return { id: g.id, name: g.name, cap: cap, filled: (g.filled != null ? g.filled : 0) };
@@ -330,24 +340,60 @@
             alert('没有找到以 "' + prefix + '" 开头的收藏夹。请先建好再点全自动。');
             return;
         }
+        // 把匹配到的当天收藏夹填进多选框、默认全选,让用户取消掉要用别的方法找达人的那几个。
+        // 存下待确认信息,点“✅ 确认开始”按钮时再真正开跑。
+        ultraShowFolderPicker(matched, { template: template, words: words, target: target, prefix: prefix });
+    }
+    // 把当天收藏夹填进面板多选框并全选,显示“确认开始”按钮,进入待确认态
+    function ultraShowFolderPicker(matched, info) {
+        if (!groupSelectEl) { alert('面板还没加载好,稍等再点'); return; }
+        // 用前缀作过滤词,把当天收藏夹显示出来
+        if (groupFilterInput) groupFilterInput.value = info.prefix;
+        if (__noxGroupCache) populateGroupOptions(__noxGroupCache, info.prefix);
+        // 全选匹配到的这些
+        var matchIds = {};
+        matched.forEach(function (f) { matchIds[String(f.id)] = 1; });
+        for (var i = 0; i < groupSelectEl.options.length; i++) {
+            var o = groupSelectEl.options[i];
+            o.selected = !!matchIds[o.value];
+        }
+        syncSelectedGroups();
+        ultraPending = info;
+        ultraStatus('已列出 ' + matched.length + ' 个收藏夹并全选。取消掉不要的,再点“✅ 确认开始”。');
+        if (ultraConfirmBtn) ultraConfirmBtn.style.display = 'block';
+    }
+    // 点“确认开始”:读当前多选框里选中的收藏夹,过滤后开跑
+    async function ultraConfirmStart() {
+        if (!ultraPending) return;
+        var info = ultraPending;
+        // 当前选中的 id
+        var chosenIds = selectedGroups.map(function (g) { return g.id; });
+        if (!chosenIds.length) { alert('至少选一个收藏夹。'); return; }
+        // 重新拉最新收藏夹,按选中 id 过滤(保证 filled/顺序最新)
+        var groupsChk;
+        try { groupsChk = await fetchGroups(true); } catch (e) { alert('拉取收藏夹失败,检查登录状态'); return; }
+        var matched = ultraPickTodayFolders(groupsChk, info.prefix, chosenIds);
+        if (!matched.length) { alert('选中的收藏夹里没有匹配当天前缀的,重选。'); return; }
         var capInfo = matched.map(function (f) { return f.name + '(' + f.filled + '/' + f.cap + ')'; }).join('\n');
-        if (!confirm('找到 ' + matched.length + ' 个收藏夹,将按此顺序依次填满:\n' + capInfo + '\n\n关键词 ' + words.length + ' 个,每批目标 ' + target + '。开始吗?')) return;
+        if (!confirm('将按此顺序依次填满这 ' + matched.length + ' 个收藏夹:\n' + capInfo + '\n\n关键词 ' + info.words.length + ' 个,每批目标 ' + info.target + '。开始吗?')) return;
         // 搜索框最多 20 个词(含排除词)。正常词能加的上限 = 20 - 模板里已有的排除词数。
-        var excludeCount = ((template.wordsList || []).filter(function (w) { return w.exclude === 1; })).length;
+        var excludeCount = ((info.template.wordsList || []).filter(function (w) { return w.exclude === 1; })).length;
         var maxWords = Math.max(1, 20 - excludeCount);
-        // 每批词跑三平台:probe 用第一个平台(YouTube)定批,collect 依次在三平台各收一次
         var platformOrder = ULTRA_PLATFORM_ORDER.slice();
         var st = {
-            running: true, platform: platformOrder[0], template: template,
+            running: true, platform: platformOrder[0], template: info.template,
             platformOrder: platformOrder, platformIdx: 0,
-            remainingWords: words.slice(1), batchWords: [words[0]],
-            target: target, prefix: prefix, maxWords: maxWords,
+            remainingWords: info.words.slice(1), batchWords: [info.words[0]],
+            target: info.target, prefix: info.prefix, maxWords: maxWords,
+            folderIds: chosenIds, // 记住用户勾选的收藏夹,续跑/换平台时按此过滤
             phase: 'probe', folders: null, folderIdx: 0,
             stats: { batches: 0, collected: 0 }
         };
         ultraSaveState(st);
+        ultraPending = null;
+        if (ultraConfirmBtn) ultraConfirmBtn.style.display = 'none';
         ultraStatus('开始,第1批探测:' + st.batchWords.join(' + '));
-        location.href = ultraBuildUrl(template, st.batchWords, st.platform);
+        location.href = ultraBuildUrl(info.template, st.batchWords, st.platform);
     }
     // 页面加载后驱动:根据 state.phase 继续。改URL会重载,所以每次加载都要 tick 一次。
     async function ultraTick() {
@@ -407,7 +453,7 @@
         // 首次进入本批:准备今天的收藏夹队列
         if (!st.folders) {
             var groups = await fetchGroups(true);
-            st.folders = ultraPickTodayFolders(groups, st.prefix);
+            st.folders = ultraPickTodayFolders(groups, st.prefix, st.folderIds);
             st.folderIdx = 0;
             ultraSaveState(st);
             if (!st.folders.length) {
@@ -954,10 +1000,15 @@
         ultraBtn.textContent = '🚀 全自动(输词→搜→收藏)';
         ultraBtn.style.cssText = 'padding:10px;background:#7c3aed;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:bold;';
         ultraBtn.addEventListener('click', startUltra);
+        // 选取收藏夹后的“确认开始”按钮:默认隐藏,进入待确认态才显示
+        ultraConfirmBtn = document.createElement('button');
+        ultraConfirmBtn.textContent = '✅ 确认开始(用选中的收藏夹)';
+        ultraConfirmBtn.style.cssText = 'padding:8px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:bold;font-size:12px;display:none;';
+        ultraConfirmBtn.addEventListener('click', ultraConfirmStart);
         var ultraStopBtn = document.createElement('button');
         ultraStopBtn.textContent = '停止全自动';
         ultraStopBtn.style.cssText = 'padding:6px;background:#9ca3af;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;';
-        ultraStopBtn.addEventListener('click', stopUltra);
+        ultraStopBtn.addEventListener('click', function () { stopUltra(); ultraPending = null; if (ultraConfirmBtn) ultraConfirmBtn.style.display = 'none'; });
         var divider = document.createElement('div');
         divider.style.borderTop = '1px dashed #ccc';
         divider.style.margin = '4px 0';
@@ -1024,6 +1075,7 @@
         stopButton.addEventListener('click', function () { stopRequested = true; });
         root.appendChild(keywordButton);
         root.appendChild(ultraBtn);
+        root.appendChild(ultraConfirmBtn);
         root.appendChild(ultraStopBtn);
         root.appendChild(divider);
         root.appendChild(groupLabel);
