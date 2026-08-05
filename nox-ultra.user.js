@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.2-ultra';
+    var SCRIPT_VERSION = '1.3-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -327,10 +327,13 @@
         var capInfo = matched.map(function (f) { return f.name + '(' + f.filled + '/' + f.cap + ')'; }).join('\n');
         if (!confirm('找到 ' + matched.length + ' 个收藏夹,将按此顺序依次填满:\n' + capInfo + '\n\n关键词 ' + words.length + ' 个,每批目标 ' + target + '。开始吗?')) return;
         var platform = getPlatformFromUrl();
+        // 搜索框最多 20 个词(含排除词)。正常词能加的上限 = 20 - 模板里已有的排除词数。
+        var excludeCount = ((template.wordsList || []).filter(function (w) { return w.exclude === 1; })).length;
+        var maxWords = Math.max(1, 20 - excludeCount);
         var st = {
             running: true, platform: platform, template: template,
             remainingWords: words.slice(1), batchWords: [words[0]],
-            target: target, prefix: prefix,
+            target: target, prefix: prefix, maxWords: maxWords,
             phase: 'probe', folders: null, folderIdx: 0,
             stats: { batches: 0, collected: 0 }
         };
@@ -371,7 +374,12 @@
             return ultraDoCollect(st);
         }
         ultraStatus('当前批 [' + st.batchWords.join(' + ') + '] 结果约 ' + count + ' 条');
-        if (count >= st.target || st.remainingWords.length === 0) {
+        var maxWords = st.maxWords || 20;
+        // 已到搜索框词数上限,不能再加了 → 直接定批
+        if (count >= st.target || st.remainingWords.length === 0 || st.batchWords.length >= maxWords) {
+            if (st.batchWords.length >= maxWords && count < st.target) {
+                ultraStatus('已达搜索框 ' + maxWords + ' 词上限,直接定批收藏');
+            }
             // 定批,进入收藏
             st.phase = 'collect'; st.folders = null; st.folderIdx = 0; ultraSaveState(st);
             await sleepPlain(600);
@@ -401,6 +409,9 @@
         }
         var pageNum = 0;
         while (true) {
+            // 每轮开头重读状态:用户点“停止”会把 running 置 false / 清空,这里要能立刻退出
+            var live = ultraLoadState();
+            if (!live || !live.running) { ultraStatus('已停止。'); return; }
             // 找到还没满的收藏夹
             while (st.folderIdx < st.folders.length && st.folders[st.folderIdx].filled >= st.folders[st.folderIdx].cap) {
                 st.folderIdx++;
