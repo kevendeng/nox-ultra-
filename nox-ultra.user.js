@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.0-ultra';
+    var SCRIPT_VERSION = '1.1-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -307,11 +307,27 @@
         var tgtRaw = prompt('每批目标结果数(累计达到就定为一批,默认 10000):', String(ULTRA_TARGET_DEFAULT));
         var target = parseInt(tgtRaw, 10);
         if (isNaN(target) || target <= 0) target = ULTRA_TARGET_DEFAULT;
+        // 收藏夹日期前缀:默认今天,允许改(方便测试/补跑)
+        var prefix = prompt('收藏进哪个日期前缀的收藏夹?(名字以此开头,含字母 m 的上限 500,其余 1000)', ultraTodayPrefix());
+        if (prefix == null) return;
+        prefix = prefix.trim();
+        if (!prefix) { alert('前缀不能为空'); return; }
+        // 启动即校验:有没有匹配的收藏夹,没有当场提示,别白跑
+        ultraStatus('检查以 "' + prefix + '" 开头的收藏夹…');
+        var groupsChk;
+        try { groupsChk = await fetchGroups(true); } catch (e) { alert('拉取收藏夹失败,检查登录状态'); return; }
+        var matched = ultraPickTodayFolders(groupsChk, prefix);
+        if (!matched.length) {
+            alert('没有找到以 "' + prefix + '" 开头的收藏夹。请先建好再点全自动。');
+            return;
+        }
+        var capInfo = matched.map(function (f) { return f.name + '(' + f.filled + '/' + f.cap + ')'; }).join('\n');
+        if (!confirm('找到 ' + matched.length + ' 个收藏夹,将按此顺序依次填满:\n' + capInfo + '\n\n关键词 ' + words.length + ' 个,每批目标 ' + target + '。开始吗?')) return;
         var platform = getPlatformFromUrl();
         var st = {
             running: true, platform: platform, template: template,
             remainingWords: words.slice(1), batchWords: [words[0]],
-            target: target, prefix: ultraTodayPrefix(),
+            target: target, prefix: prefix,
             phase: 'probe', folders: null, folderIdx: 0,
             stats: { batches: 0, collected: 0 }
         };
