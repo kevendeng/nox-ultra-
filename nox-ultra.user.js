@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/search/*
 // @match        https://cn.noxinfluencer.com/lookalike/*
@@ -18,7 +18,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '1.1-ultra';
+    var SCRIPT_VERSION = '1.2-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -279,8 +279,11 @@
     // 名字含字母 m -> 上限 500,其余 -> 1000。返回 [{id,name,cap,filled}...]
     function ultraPickTodayFolders(groups, prefix) {
         var pfx = prefix || ultraTodayPrefix();
-        var todays = groups.filter(function (g) { return (g.name || '').indexOf(pfx) === 0; });
-        // groups 传进来是按创建时间倒序(最新在前),这里反转成正序(先建的先填)
+        // 只在最新建的前 100 个收藏夹里找,排除掉去年同前缀(如去年 0806)的老夹子。
+        // groups 按创建时间倒序(最新在前),取前 100 即最近建的。
+        var recent = groups.slice(0, 100);
+        var todays = recent.filter(function (g) { return (g.name || '').indexOf(pfx) === 0; });
+        // 反转成正序(先建的先填)
         todays = todays.slice().reverse();
         return todays.map(function (g) {
             var cap = /m/i.test(g.name || '') ? 500 : 1000;
