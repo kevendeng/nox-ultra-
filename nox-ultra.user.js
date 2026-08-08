@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '2.3-ultra';
+    var SCRIPT_VERSION = '2.4-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -168,6 +168,7 @@
     // 全自动“选取收藏夹”待确认态:收集完输入后,等用户在多选框里取消不要的,再点确认开跑
     var ultraPending = null;
     var ultraConfirmBtn = null;
+    var ultraRefreshLogCount = null; // 面板构建后指向"刷新已记录批数"的函数
     async function startBatchProcess() {
         if (isScriptRunning) return;
         var userLimit = parseInt(limitInput.value, 10);
@@ -272,6 +273,64 @@
     }
     function ultraClearState() {
         try { localStorage.removeItem(ULTRA_LS); } catch (e) {}
+    }
+    // ---- 批次历史日志(累积,跨任务保留,可导出 CSV) ----
+    // 记录:每次成功收藏一页,追加一条 {time, words:[本批词], platform:平台名, folder:收藏夹名, count:本次收藏数}
+    var ULTRA_LOG_LS = 'noxUltra.batchLog';
+    function ultraLoadLog() {
+        try { return JSON.parse(localStorage.getItem(ULTRA_LOG_LS) || '[]'); } catch (e) { return []; }
+    }
+    function ultraSaveLog(list) {
+        try { localStorage.setItem(ULTRA_LOG_LS, JSON.stringify(list)); } catch (e) {}
+    }
+    function ultraAppendLog(words, platformName, folderName, count) {
+        var list = ultraLoadLog();
+        var now = new Date();
+        var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+        var ts = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate())
+            + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+        list.push({
+            time: ts,
+            words: (words || []).slice(),
+            platform: platformName || '',
+            folder: folderName || '',
+            count: count || 0
+        });
+        ultraSaveLog(list);
+        if (typeof ultraRefreshLogCount === 'function') ultraRefreshLogCount();
+    }
+    // 导出批次历史为 CSV:时间、关键词、平台、收藏夹、收藏数量
+    function ultraExportLog() {
+        var list = ultraLoadLog();
+        if (!list.length) { alert('还没有批次记录。跑一次全自动收藏后再导出。'); return; }
+        var rows = [['时间', '关键词', '平台', '收藏夹', '收藏数量']];
+        for (var i = 0; i < list.length; i++) {
+            var r = list[i];
+            rows.push([
+                r.time || '',
+                (r.words || []).join(' + '),
+                r.platform || '',
+                r.folder || '',
+                String(r.count == null ? '' : r.count)
+            ]);
+        }
+        var esc = function (s) {
+            s = String(s == null ? '' : s);
+            if (/[",\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+            return s;
+        };
+        var csv = rows.map(function (row) { return row.map(esc).join(','); }).join('\r\n');
+        var blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        var now = new Date();
+        var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+        a.href = url;
+        a.download = 'nox-batch-log-' + now.getFullYear() + pad(now.getMonth() + 1) + pad(now.getDate()) + '.csv';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
     }
     // 统一跳转:任务循环里所有 location.href 都走这里。
     // 若此刻用户在收藏夹/邮件/CRM 页(SPA 软导航过去干活),不要跳走打断——
@@ -513,6 +572,8 @@
                         st.stats.collected += ids.length;
                         st.platformCollected += ids.length;
                         ultraSaveState(st);
+                        // 记一条批次历史:本批词 -> 收进了哪个收藏夹(累积,可导出)
+                        ultraAppendLog(st.batchWords, ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform), folder.name, ids.length);
                     }
                 }
                 // 测试模式:本平台已达上限,当作“本平台本批收完”,走切平台逻辑
@@ -1082,6 +1143,28 @@
             if (!confirm('结束并清理会丢弃当前进度,之后无法"继续"。确定?')) return;
             stopUltra(); ultraPending = null; if (ultraConfirmBtn) ultraConfirmBtn.style.display = 'none';
         });
+        // 批次历史导出(每批词 -> 收进哪个收藏夹,累积,可导出 CSV)
+        var ultraLogBtn = document.createElement('button');
+        ultraLogBtn.textContent = '导出批次记录 CSV';
+        ultraLogBtn.title = '导出每批用了哪些词、收进了哪个收藏夹';
+        ultraLogBtn.style.cssText = 'padding:8px;background:#607d8b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;';
+        ultraLogBtn.addEventListener('click', ultraExportLog);
+        var ultraLogMetaRow = document.createElement('div');
+        ultraLogMetaRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#888;';
+        var ultraLogCountLabel = document.createElement('span');
+        ultraRefreshLogCount = function () { ultraLogCountLabel.textContent = '已记录 ' + ultraLoadLog().length + ' 批'; };
+        ultraRefreshLogCount();
+        var ultraLogClearBtn = document.createElement('span');
+        ultraLogClearBtn.textContent = '清空';
+        ultraLogClearBtn.style.cssText = 'color:#f44336;cursor:pointer;text-decoration:underline;';
+        ultraLogClearBtn.addEventListener('click', function () {
+            if (confirm('确定清空所有批次记录？导出过的文件不受影响。')) {
+                ultraSaveLog([]);
+                ultraRefreshLogCount();
+            }
+        });
+        ultraLogMetaRow.appendChild(ultraLogCountLabel);
+        ultraLogMetaRow.appendChild(ultraLogClearBtn);
         var divider = document.createElement('div');
         divider.style.borderTop = '1px dashed #ccc';
         divider.style.margin = '4px 0';
@@ -1163,6 +1246,8 @@
         root.appendChild(ultraConfirmBtn);
         root.appendChild(ultraPauseRow);
         root.appendChild(ultraStopBtn);
+        root.appendChild(ultraLogBtn);
+        root.appendChild(ultraLogMetaRow);
         root.appendChild(divider);
         root.appendChild(groupLabel);
         root.appendChild(filterRow);
