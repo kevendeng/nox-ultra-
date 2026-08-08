@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '2.2-ultra';
+    var SCRIPT_VERSION = '2.3-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -273,6 +273,19 @@
     function ultraClearState() {
         try { localStorage.removeItem(ULTRA_LS); } catch (e) {}
     }
+    // 统一跳转:任务循环里所有 location.href 都走这里。
+    // 若此刻用户在收藏夹/邮件/CRM 页(SPA 软导航过去干活),不要跳走打断——
+    // 自动暂停(running=false,保留状态),等回搜索页或点"继续"再续跑。返回是否真的跳了。
+    function ultraNavigate(url) {
+        if (isFolderPage() || isEmailPage() || isCrmPage()) {
+            var st = ultraLoadState();
+            if (st) { st.running = false; ultraSaveState(st); }
+            ultraStatus('检测到你切到了其它页面,已自动暂停(进度已保留)。回搜索页或点"继续"接着跑。');
+            return false;
+        }
+        location.href = url;
+        return true;
+    }
     // 今天日期前缀,如 8月4日 -> "0804"
     function ultraTodayPrefix() {
         var d = new Date();
@@ -439,7 +452,7 @@
         st.batchWords.push(next);
         ultraSaveState(st);
         await sleepPlain(400);
-        location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
+        ultraNavigate(ultraBuildUrl(st.template, st.batchWords, st.platform));
     }
     // 收藏:本批(当前URL已是最终词组)。逐页抓可见达人,按收藏夹上限依次填满换下一个。
     async function ultraDoCollect(st) {
@@ -533,7 +546,7 @@
             var nextName = ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform);
             ultraStatus('批' + (st.stats.batches + 1) + ' 切到 ' + nextName + ' 继续收藏…');
             await sleepPlain(600);
-            location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
+            ultraNavigate(ultraBuildUrl(st.template, st.batchWords, st.platform));
             return true;
         }
         // 三平台都跑完:本批完成
@@ -553,7 +566,7 @@
         st.batchWords = [st.remainingWords.shift()];
         ultraSaveState(st);
         await sleepPlain(600);
-        location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
+        ultraNavigate(ultraBuildUrl(st.template, st.batchWords, st.platform));
         return true;
     }
     // 暂停:只把 running 置 false,保留全部任务状态。正在跑的 tick 循环下一轮读到 running=false 会退出。
