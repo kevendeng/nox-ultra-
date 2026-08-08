@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '2.1-ultra';
+    var SCRIPT_VERSION = '2.2-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -556,6 +556,30 @@
         location.href = ultraBuildUrl(st.template, st.batchWords, st.platform);
         return true;
     }
+    // 暂停:只把 running 置 false,保留全部任务状态。正在跑的 tick 循环下一轮读到 running=false 会退出。
+    // 状态还在,可随时"继续"接着跑。
+    function pauseUltra() {
+        var st = ultraLoadState();
+        if (!st) { ultraStatus('没有进行中的全自动任务。'); return; }
+        st.running = false; ultraSaveState(st);
+        ultraStatus('已暂停(已收藏 ' + (st.stats ? st.stats.collected : 0) + ' 个)。点"继续全自动"接着跑。');
+    }
+    // 继续:恢复 running=true,统一通过导航让 ultraAutoResume 接手续跑,避免出现两个 tick 循环重入。
+    //  - 不在搜索结果页:跳回该批词的搜索 URL,重载后自动续跑
+    //  - 已在搜索结果页:reload 当前页,重载后自动续跑
+    function resumeUltra() {
+        var st = ultraLoadState();
+        if (!st) { ultraStatus('没有可继续的任务。请点"全自动"重新开始。'); return; }
+        st.running = true; ultraSaveState(st);
+        ultraStatus('继续中,正在跳回搜索页…');
+        if (!isSearchResultPage()) {
+            try { location.href = ultraBuildUrl(st.template, st.batchWords, st.platform); }
+            catch (e) { ultraStatus('继续失败:' + (e && e.message) + '。可点"全自动"重开。'); }
+        } else {
+            location.reload();
+        }
+    }
+    // 彻底停止并清理状态(不可继续)。用于任务作废、换任务重开等。
     function stopUltra() {
         var st = ultraLoadState();
         if (st) { st.running = false; ultraSaveState(st); }
@@ -1023,10 +1047,28 @@
         ultraConfirmBtn.textContent = '✅ 确认开始(用选中的收藏夹)';
         ultraConfirmBtn.style.cssText = 'padding:8px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:bold;font-size:12px;display:none;';
         ultraConfirmBtn.addEventListener('click', ultraConfirmStart);
-        var ultraStopBtn = document.createElement('button');
-        ultraStopBtn.textContent = '停止全自动';
-        ultraStopBtn.style.cssText = 'padding:6px;background:#9ca3af;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;';
-        ultraStopBtn.addEventListener('click', function () { stopUltra(); ultraPending = null; if (ultraConfirmBtn) ultraConfirmBtn.style.display = 'none'; });
+        // 暂停 / 继续 一行(暂停保留进度,继续接着跑)
+        var ultraPauseRow = document.createElement('div');
+        ultraPauseRow.style.cssText = 'display:flex;gap:6px;';
+        var ultraPauseBtn = document.createElement('button');
+        ultraPauseBtn.textContent = '⏸ 暂停';
+        ultraPauseBtn.style.cssText = 'flex:1;padding:6px;background:#f59e0b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;';
+        ultraPauseBtn.addEventListener('click', function () { pauseUltra(); });
+        var ultraResumeBtn = document.createElement('button');
+        ultraResumeBtn.textContent = '▶ 继续';
+        ultraResumeBtn.style.cssText = 'flex:1;padding:6px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;';
+        ultraResumeBtn.addEventListener('click', function () { resumeUltra(); });
+        ultraPauseRow.appendChild(ultraPauseBtn);
+        ultraPauseRow.appendChild(ultraResumeBtn);
+        // 彻底结束并清理(不可继续),做成不显眼的小链接,避免误点丢进度
+        var ultraStopBtn = document.createElement('a');
+        ultraStopBtn.textContent = '结束并清理进度';
+        ultraStopBtn.href = 'javascript:void(0)';
+        ultraStopBtn.style.cssText = 'display:block;text-align:center;color:#9ca3af;font-size:11px;text-decoration:underline;cursor:pointer;';
+        ultraStopBtn.addEventListener('click', function () {
+            if (!confirm('结束并清理会丢弃当前进度,之后无法"继续"。确定?')) return;
+            stopUltra(); ultraPending = null; if (ultraConfirmBtn) ultraConfirmBtn.style.display = 'none';
+        });
         var divider = document.createElement('div');
         divider.style.borderTop = '1px dashed #ccc';
         divider.style.margin = '4px 0';
@@ -1106,6 +1148,7 @@
         root.appendChild(keywordButton);
         root.appendChild(ultraBtn);
         root.appendChild(ultraConfirmBtn);
+        root.appendChild(ultraPauseRow);
         root.appendChild(ultraStopBtn);
         root.appendChild(divider);
         root.appendChild(groupLabel);
