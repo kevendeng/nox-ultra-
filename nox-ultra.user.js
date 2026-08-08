@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '2.0-ultra';
+    var SCRIPT_VERSION = '2.1-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -2035,6 +2035,11 @@
     function ultraAutoResume() {
         var st = ultraLoadState();
         if (!st || !st.running) return;
+        // 收藏夹/邮件邀请/CRM 页:用户是主动切过去干活的,别把人跳回搜索页打断。
+        // 这些页面不触发自动恢复(任务状态仍保留,回到搜索页或首页时再续)。
+        if (isFolderPage() || isEmailPage() || isCrmPage()) {
+            return;
+        }
         // 被人机验证/意外跳转甩到了非搜索结果页(首页等):任务状态还在,只是页面不对。
         // 显示倒计时提示条,自动跳回该批词应在的搜索 URL 续跑。
         if (!isSearchResultPage()) {
