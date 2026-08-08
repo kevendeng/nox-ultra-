@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '2.4-ultra';
+    var SCRIPT_VERSION = '2.5-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -289,13 +289,25 @@
         var pad = function (n) { return (n < 10 ? '0' : '') + n; };
         var ts = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate())
             + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
-        list.push({
-            time: ts,
-            words: (words || []).slice(),
-            platform: platformName || '',
-            folder: folderName || '',
-            count: count || 0
-        });
+        var wordsArr = (words || []).slice();
+        var wordsKey = wordsArr.join(' + ');
+        var plat = platformName || '';
+        var fold = folderName || '';
+        // 合并:同一批词 + 同平台 + 同收藏夹 的多页,累加到同一条(收藏数相加,更新时间)。
+        // 从后往前找最近一条匹配的,避免跨很久的旧记录被误并。
+        var merged = false;
+        for (var i = list.length - 1; i >= 0; i--) {
+            var e = list[i];
+            if ((e.words || []).join(' + ') === wordsKey && (e.platform || '') === plat && (e.folder || '') === fold) {
+                e.count = (e.count || 0) + (count || 0);
+                e.time = ts; // 记最后一次收藏时间
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            list.push({ time: ts, words: wordsArr, platform: plat, folder: fold, count: count || 0 });
+        }
         ultraSaveLog(list);
         if (typeof ultraRefreshLogCount === 'function') ultraRefreshLogCount();
     }
@@ -1152,7 +1164,7 @@
         var ultraLogMetaRow = document.createElement('div');
         ultraLogMetaRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#888;';
         var ultraLogCountLabel = document.createElement('span');
-        ultraRefreshLogCount = function () { ultraLogCountLabel.textContent = '已记录 ' + ultraLoadLog().length + ' 批'; };
+        ultraRefreshLogCount = function () { ultraLogCountLabel.textContent = '已记录 ' + ultraLoadLog().length + ' 条(词×收藏夹)'; };
         ultraRefreshLogCount();
         var ultraLogClearBtn = document.createElement('span');
         ultraLogClearBtn.textContent = '清空';
