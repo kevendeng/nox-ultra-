@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      2.6
-// @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
+// @version      2.7
+// @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
 // @run-at       document-end
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '2.6-ultra';
+    var SCRIPT_VERSION = '2.7-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -1784,433 +1784,293 @@
         root.appendChild(emailStatusEl);
         root.appendChild(hint);
     }
-    // ==================== CRM PAGE: filter 建联中 + select-all across pages ====================
-    var crmRunning = false, crmStop = false, crmTotal = 0, crmLimit = 1000;
-    var crmStartBtn, crmStopBtn, crmLimitInput, crmStatusEl;
-    // 按可见文字找元素：只返回“叶子级”命中（即候选元素内部不再包含另一个同样精确匹配的候选），
-    // 这样点击的一定是真正绑定了点击事件的最内层节点，而不是外层的包裹 div/span。
-    // 之前的版本用 children.length<=2 这种启发式来避免命中外层容器，但像 Nox 页面里
-    // “<div class="search-filter-wrap"><div class="kol-btn filter-btn">...高级筛选</div></div>”
-    // 这种结构外层只包了一个按钮，children.length===1，会被误判成“叶子”，先被点击，
-    // 导致真正绑定 @click 的内层 .kol-btn 从未被点到（事件冒泡只会向上，不会向下传导）。
-    function findByText(text, tags) {
-        tags = tags || ['button', 'span', 'div', 'li', 'a', 'label'];
-        var sel = tags.join(',');
-        var nodes = document.querySelectorAll(sel);
-        function collect(matchFn) {
-            var candidates = [];
-            for (var i = 0; i < nodes.length; i++) {
-                var el = nodes[i];
-                if (!isElementVisible(el)) continue;
-                var txt = (el.textContent || '').trim();
-                if (matchFn(txt)) candidates.push(el);
-            }
-            // 只保留叶子级:一个候选如果内部包含另一个候选,就把它自己排除(它是外层容器)
-            var leaves = candidates.filter(function (el) {
-                for (var j = 0; j < candidates.length; j++) {
-                    if (candidates[j] !== el && el.contains(candidates[j])) return false;
-                }
-                return true;
-            });
-            return leaves.length ? leaves[0] : null;
-        }
-        // 第一轮:精确匹配
-        var exact = collect(function (txt) { return txt === text; });
-        if (exact) return exact;
-        // 第二轮:放宽为包含
-        var loose = collect(function (txt) { return txt.indexOf(text) !== -1; });
-        return loose;
-    }
-    function clickReal(el) {
-        if (!el) return false;
-        ['mousedown', 'mouseup', 'click'].forEach(function (t) {
-            el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
-        });
-        return true;
-    }
+    // ==================== CRM PAGE: 纯接口版(收藏进夹 → 归档) ====================
+    // 旧版是"点页面/翻页/数勾选"那套,脆且慢。现在改成直接调 4 个接口,全程不碰页面 DOM:
+    //   1) POST /ws/crm/getList            翻页拉"建联中"达人的 {channelId, platform}
+    //   2) POST /ws/collection/crm/addToCollect  把这批 channels 收进指定收藏夹(groupIds)
+    //   3) GET  /ws/v2/crm/progress        轮询任务进度(type=collect|delete, status=SUCCESS)
+    //   4) POST /ws/crm/batchUpdateChannel deleteFlag:1 归档(把这批移出"建联中")
+    // 面板照搬搜索页那套:日期前缀 + 收藏夹勾选。每个夹子依次跑:拉够 cap 人→收藏→等成功→归档→等成功→下一个。
+    // cap:夹名含字母 M → 500,否则 1000(跟搜索页 ultraPickTodayFolders 同规则)。
+    var crmRunning = false, crmStop = false;
+    var crmPrefixInput, crmGroupSelectEl, crmGroupFilterInput, crmStartBtn, crmStopBtn, crmStatusEl;
+    var crmSelectedGroups = [];
+    var CRM_FILTER = { teamContactStatus: [2] }; // 建联中
+    var CRM_SEARCH_PARAM = { id: 0, filter: CRM_FILTER };
+
     function setCrmStatus(t) { if (crmStatusEl) crmStatusEl.textContent = t; console.log('[CRM] ' + t); }
-    function getCrmSelectAll() {
-        var head = document.querySelector('thead .el-checkbox__input, .el-table__header .el-checkbox__input');
-        if (head && isElementVisible(head)) return head;
-        var all = document.querySelectorAll('.el-checkbox__input');
-        for (var i = 0; i < all.length; i++) { if (isElementVisible(all[i])) return all[i]; }
-        return null;
+
+    // 统一的同源 POST(cookie 自动带)。返回解析后的 JSON。
+    async function crmPost(path, payload) {
+        var res = await fetch('https://cn.noxinfluencer.com' + path, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(payload)
+        });
+        var d = null;
+        try { d = await res.json(); } catch (e) { d = null; }
+        if (!res.ok) throw new Error(path + ' HTTP ' + res.status);
+        return d;
     }
-    function countCrmChecked() {
-        return document.querySelectorAll('.el-table__body .el-checkbox__input.is-checked, tbody .el-checkbox__input.is-checked').length;
+
+    // 拉一页"建联中"列表。pageNum 从 1 开始。返回原始响应(含 retDataList / totalSize / totalPage)。
+    async function crmGetListPage(pageNum, pageSize) {
+        return crmPost('/ws/crm/getList', {
+            id: 0, pageNum: pageNum, pageSize: pageSize, filter: CRM_FILTER
+        });
     }
-    // 读取网站顶部那个权威计数“已选500个网红”。这是跨页累计的真实值,
-    // 比自己一页页累加可靠得多(el-table 有固定列时每行 DOM 会渲染两遍,自己数会翻倍)。
-    // 读不到就返回 null,让调用方回退到旧的累加逻辑。
-    function readCrmSelectedCount() {
-        var nodes = document.querySelectorAll('span, div, b, em, strong');
-        for (var i = 0; i < nodes.length; i++) {
-            var el = nodes[i];
-            // 只看没有子元素的叶子节点,避免把父容器的一大段文字也匹配进来
-            if (el.children && el.children.length > 0) continue;
-            var m = (el.textContent || '').match(/已选\s*(\d+)\s*个网红/);
-            if (m) return parseInt(m[1], 10);
+
+    // 翻页拉取,直到攒够 need 个达人或列表拉完。返回 [{channelId, platform}, ...](已去重)。
+    async function crmCollectChannels(need) {
+        var out = [], seen = {}, pageSize = 100, pageNum = 1, totalPage = 1;
+        while (out.length < need) {
+            if (crmStop) throw new Error('stopped');
+            setCrmStatus('拉取名单… 第 ' + pageNum + ' 页(已 ' + out.length + '/' + need + ')');
+            var d = await crmGetListPage(pageNum, pageSize);
+            var list = (d && d.retDataList) || [];
+            totalPage = (d && d.totalPage) || 1;
+            if (!list.length) break;
+            for (var i = 0; i < list.length; i++) {
+                var c = list[i];
+                if (!c || !c.channelId) continue;
+                if (seen[c.channelId]) continue;
+                seen[c.channelId] = 1;
+                out.push({ channelId: String(c.channelId), platform: c.platform });
+                if (out.length >= need) break;
+            }
+            if (pageNum >= totalPage) break;
+            pageNum++;
+            await sleepPlain(400);
         }
-        // 兜底:整页文本里搜一次(某些主题会把数字拆进子 span)
-        var m2 = (document.body.innerText || '').match(/已选\s*(\d+)\s*个网红/);
-        return m2 ? parseInt(m2[1], 10) : null;
+        return out;
     }
-    // 当前表格里有多少数据行(用来判断筛选后是否为空)。排除空态占位行。
-    function countCrmRows() {
-        var rows = document.querySelectorAll('.el-table__body-wrapper tbody tr.el-table__row');
-        if (rows.length) return rows.length;
-        return document.querySelectorAll('.el-table__body-wrapper tbody tr').length;
+
+    // 读取进度列表里"某类型(collect/delete)且 id 最大"的那条 id。用来做基准:
+    // 提交任务后,只认 id 比基准更大的同类型任务,避免把上一次的旧任务当成本次结果(时钟无关,靠自增 id)。
+    async function crmMaxProgressId(type) {
+        var res = await fetch('https://cn.noxinfluencer.com/ws/v2/crm/progress', { credentials: 'include' });
+        var d = null; try { d = await res.json(); } catch (e) { d = null; }
+        var list = (d && d.retDataList) || [];
+        var max = 0;
+        for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].type === type && list[i].id > max) max = list[i].id;
+        }
+        return max;
     }
-    // 等待某个条件成立(用于替代“点了就假设生效”的写法),避免筛选面板/下拉还没渲染完就点确定
-    async function waitUntil(fn, timeout, interval) {
-        timeout = timeout || 8000; interval = interval || 300;
-        var start = Date.now();
+
+    // 轮询进度,等"类型=type 且 id>baselineId"的那条任务出结果。
+    // 成功返回 true;失败(status=FAIL 等)抛错;超时抛错。
+    async function crmWaitProgress(type, baselineId, label) {
+        var timeout = 180000, start = Date.now();
         while (Date.now() - start < timeout) {
             if (crmStop) throw new Error('stopped');
-            var v = fn();
-            if (v) return v;
-            await sleep(interval);
-        }
-        return null;
-    }
-    // 找到"团队联系状态"的复选框下拉面板本身(而不是页面上任何写着同名文字的地方,
-    // 比如表格里某一行的状态列也会显示"建联中"这几个字,如果不限定范围很容易点错)。
-    // 从截图确认到的真实结构是: .el-select-dropdown.is-multiple.check-select-dropdown.crm-drawer-filter-pop
-    // 每个选项是 li.el-select-dropdown__item > div.check-select-option > (span.el_check_box + span.el_check_text)
-    // optionText: 期望这个下拉面板里含有的选项文字(比如“建联中”)。
-    // 页面上可能同时存在多个多选下拉面板(不同筛选字段各有一个),只靠“可见”会拿到错的那个,
-    // 于是后面就在错误的面板里找不到/点错选项。这里要求面板里真的含有目标选项才算命中,
-    // 从根上避免“选到别的地方”。传空时退回旧的“第一个可见面板”行为(兼容调用方)。
-    function getCheckSelectDropdown(optionText) {
-        var ds = document.querySelectorAll('.el-select-dropdown.is-multiple, .check-select-dropdown, [class*="crm-drawer-filter-pop"]');
-        var firstVisible = null;
-        for (var i = 0; i < ds.length; i++) {
-            if (!isElementVisible(ds[i])) continue;
-            if (!firstVisible) firstVisible = ds[i];
-            if (!optionText) return ds[i];
-            if (findCheckOption(ds[i], optionText)) return ds[i];
-        }
-        return optionText ? null : firstVisible;
-    }
-    // 在下拉面板范围内(不是全页面)按选项文字找到对应的 li,并返回该 li 内真正可点击的复选框行(div.check-select-option),
-    // 避免点到外层 li 或内层文字 span 导致点击目标错位。
-    function findCheckOption(dropdown, text) {
-        var items = dropdown.querySelectorAll('li.el-select-dropdown__item, .el-select-dropdown__item');
-        for (var i = 0; i < items.length; i++) {
-            var textSpan = items[i].querySelector('.el_check_text');
-            var label = textSpan ? textSpan.textContent.trim() : items[i].textContent.trim();
-            if (label === text && isElementVisible(items[i])) {
-                return items[i].querySelector('.check-select-option') || items[i];
-            }
-        }
-        return null;
-    }
-    // 判断“建联中”这类自定义复选项是否已勾选。这个页面不是标准 el-checkbox,选中标记可能出现在
-    // li(.selected)、复选框 span(.el_check_box 上的 is-checked/checked/is-active),或框里多出一个对勾图标。
-    // 之前只认 .is-checked / li.selected,一旦实际用的是别的类名就会“误判成没勾上”,进而触发二次点击
-    // 把已勾选的又切回去,最终筛选为空、选 0 人。这里把常见的几种选中信号都覆盖上。
-    function isOptionChecked(optionEl) {
-        if (!optionEl) return false;
-        var li = optionEl.closest('li') || optionEl;
-        // DevTools 确认:选中时 li 加 class="selected",且 .el_check_box 里出现打勾图标 i.kol-icon-checkmark
-        if (li.classList.contains('selected')) return true;
-        if (li.getAttribute('aria-selected') === 'true') return true;
-        if (li.querySelector('.kol-icon-checkmark, .is-checked, .checked, .is-active')) return true;
-        var box = li.querySelector('.el_check_box');
-        if (box) {
-            if (/(^|\s)(is-checked|checked|is-active|active)(\s|$)/i.test(box.className)) return true;
-            // 选中时复选框里会多出一个对勾图标(i.kolicon.kol-icon-checkmark / svg / 其它 icon)
-            if (box.querySelector('svg, i, .icon, [class*="icon"], [class*="tick"], [class*="check"]')) return true;
-        }
-        return false;
-    }
-    // "团队联系状态"只是字段的文字标题,不是可点击的下拉触发器——真正能打开下拉框的是
-    // 标题旁边/下方的选择框(el-select 组件,显示"全部"字样)。之前的版本直接点标题文字,
-    // 标题上没有绑定任何 Vue 点击事件,所以下拉框永远不会打开,后面所有步骤都会超时失败。
-    // 这里改成:先定位标题文字,再往上找到它和选择框共同的父容器,在容器内找真正的
-    // .el-select 触发器来点击。逐级往上最多找 5 层,避免因为不确定的 DOM 层级结构而找不到。
-    // 高级筛选面板是两列网格,每个字段的下拉框(el-select,显示“全部”)就正好在它标题文字的
-    // 正下方。之前用“父容器里第一个 el-select”或“文档顺序上紧跟的 el-select”都不可靠:一旦
-    // DOM 顺序或容器嵌套跟视觉排布不一致,就会串到相邻字段(实测点成了左列的“对接人”,弹出的是
-    // 邮箱列表)。这里改成照着屏幕坐标来——只认标题正下方、横向对齐、且离得最近的那个 el-select,
-    // 从几何位置上杜绝“选到别的地方”。
-    function findFilterSelectTrigger(labelText) {
-        // 首选:按真实 DOM 结构定位(靠 DevTools 确认过)。每个筛选字段是
-        //   div.filter-item > p.filter-name(字段标题) + div.filter-item-check-wrap > div.el-select(真正的触发器)
-        // 只要标题文字对上,就在同一个 .filter-item 里取 .el-select,几何位置怎么排都不会串到隔壁字段。
-        var names = document.querySelectorAll('p.filter-name, .filter-name');
-        for (var n = 0; n < names.length; n++) {
-            if ((names[n].textContent || '').trim() !== labelText) continue;
-            var item = names[n].closest('.filter-item') || names[n].parentElement;
-            if (!item) continue;
-            var sel = item.querySelector('.el-select');
-            if (sel && isElementVisible(sel)) {
-                return sel.querySelector('.el-input__inner') || sel.querySelector('.el-select__tags') || sel;
-            }
-        }
-        // 兜底:老的几何定位(标题正下方、横向对齐、最近的 el-select),以防上面的类名将来变了。
-        var label = findByText(labelText, ['span', 'div', 'label', 'p']);
-        if (!label) return null;
-        var lr = label.getBoundingClientRect();
-        var selects = document.querySelectorAll('.el-select');
-        var best = null, bestGap = Infinity;
-        for (var i = 0; i < selects.length; i++) {
-            var s = selects[i];
-            if (!isElementVisible(s) || label.contains(s) || s.contains(label)) continue;
-            var sr = s.getBoundingClientRect();
-            // 必须在标题下方(允许少量重叠余量),且与标题横向有重叠(同一列)
-            var below = sr.top >= lr.top - 4;
-            var horizontallyAligned = sr.left < lr.right && sr.right > lr.left;
-            if (!below || !horizontallyAligned) continue;
-            var gap = sr.top - lr.bottom;
-            if (gap < -lr.height) continue; // 排除跑到标题上方太多的
-            if (gap < bestGap) { bestGap = gap; best = s; }
-        }
-        if (best) return best.querySelector('.el-input__inner') || best;
-        return null;
-    }
-    // 一次性的筛选流程:高级筛选 → 团队联系状态 → 建联中 → 确定
-    async function crmApplyFilter() {
-        setCrmStatus('点开 高级筛选…');
-        var adv = findByText('高级筛选', ['div', 'span', 'button']);
-        if (!clickReal(adv)) { setCrmStatus('找不到 高级筛选按钮'); return false; }
-        // 等"团队联系状态"这个筛选字段出现(在筛选面板里,而不是下拉弹窗)
-        var panelOpen = await waitUntil(function () { return findByText('团队联系状态', ['span', 'div', 'label', 'li']); }, 6000);
-        if (!panelOpen) { setCrmStatus('高级筛选面板没展开,请检查是否已点开'); return false; }
-        await sleep(400);
-        setCrmStatus('打开 团队联系状态 下拉框…');
-        var trigger = await waitUntil(function () { return findFilterSelectTrigger('团队联系状态'); }, 4000);
-        if (!trigger) { setCrmStatus('找不到 团队联系状态 的下拉触发器'); return false; }
-        clickReal(trigger);
-        await sleep(500);
-        // 等待"团队联系状态"对应的复选框下拉面板真正打开(靠 class 特征定位,不是靠文字),
-        // 这样才能确保下一步点的是弹窗里的选项,而不是页面上表格里同名的状态文字。
-        setCrmStatus('等待状态选项面板打开…');
-        // 要求面板里真的含有“建联中”这个选项才算命中,避免误认成别的字段的下拉面板
-        var dropdown = await waitUntil(function () { return getCheckSelectDropdown('建联中'); }, 6000);
-        if (!dropdown) {
-            // 有些情况下第一次点击没能触发下拉(比如动画/焦点问题),再点一次触发器重试
-            clickReal(trigger);
-            await sleep(500);
-            dropdown = await waitUntil(function () { return getCheckSelectDropdown('建联中'); }, 4000);
-        }
-        if (!dropdown) { setCrmStatus('状态下拉面板没出现'); return false; }
-        await sleep(300);
-        setCrmStatus('选择 建联中…');
-        var lianjieOption = await waitUntil(function () { return findCheckOption(dropdown, '建联中'); }, 6000);
-        if (!lianjieOption) { setCrmStatus('下拉面板里没找到 建联中选项'); return false; }
-        // 关键教训:这个选项是“开关”,点一次勾上、再点一次取消。之前版本会在“选中检测”失灵时盲目补点,
-        // 把刚勾上的又切回去,最终筛选为空、选 0 人。而选中后 DOM 到底加什么标记并不确定,检测本身不可靠。
-        // 好在下拉面板每次打开都是全空的(起点必为“未选”),所以最稳的做法是:无条件只点一次 = 选中,
-        // 之后的检测只用来“判断是否成功并提示”,绝不拿检测结果去决定要不要再点,从根上杜绝反复横跳。
-        clickReal(lianjieOption);
-        await sleep(600);
-        var okChecked = isOptionChecked(findCheckOption(dropdown, '建联中'));
-        if (!okChecked) {
-            // 检测显示没选中——但检测可能不准。只在“确实还没选中”时补一次,且补完再看一眼;
-            // 若两次点击后仍判定未选,大概率是检测识别不了这个页面的选中标记,此时不再强行判定失败,
-            // 而是继续走后面的“确定”,由最终结果的行数来说明是否真的筛出了数据。
-            clickReal(findCheckOption(dropdown, '建联中'));
-            await sleep(600);
-            okChecked = isOptionChecked(findCheckOption(dropdown, '建联中'));
-            if (!okChecked) {
-                // 兜底:把状态恢复成“只点了奇数次=选中”。上面共点了 2 次(=未选),这里再点 1 次凑成 3 次=选中。
-                clickReal(findCheckOption(dropdown, '建联中'));
-                await sleep(600);
-                setCrmStatus('已点选 建联中(选中标记无法确认,以最终筛选结果为准)');
-            }
-        }
-        await sleep(400);
-        // 收起下拉面板(再点一次同一个触发器,让下拉收起,避免遮挡确定按钮)
-        clickReal(trigger);
-        await sleep(500);
-        setCrmStatus('点击 确定…');
-        var ok = findByText('确定', ['button', 'span', 'div']);
-        if (ok) { clickReal(ok); await sleep(2000); }
-        else { setCrmStatus('没找到确定按钮,筛选可能未生效'); return false; }
-        return true;
-    }
-    // 设置每页 100 条
-    async function crmSetPageSize100() {
-        setCrmStatus('设置 100 条/页…');
-        var sizeBox = null;
-        // DevTools 确认:每页条数是 span.el-pagination__sizes 里的 div.el-select(触发器是里面的 input.el-input__inner,
-        // placeholder="请选择")。它显示的“50条/页”是 input 的 value,不是 textContent,所以不能再用文字匹配去找,
-        // 必须按结构定位,否则永远找不到、直接跳过。
-        var sizesWrap = document.querySelector('.el-pagination__sizes');
-        if (sizesWrap) {
-            var selInSizes = sizesWrap.querySelector('.el-select');
-            if (selInSizes && isElementVisible(selInSizes)) sizeBox = selInSizes;
-        }
-        if (!sizeBox) {
-            // 兜底:老的文字匹配(万一将来结构变了)
-            var candidates = document.querySelectorAll('.el-pagination .el-select, .el-pagination__sizes, .el-select');
-            for (var i = 0; i < candidates.length; i++) {
-                if (/条\/页/.test(candidates[i].textContent) && isElementVisible(candidates[i])) { sizeBox = candidates[i]; break; }
-            }
-        }
-        if (sizeBox) {
-            // 点 input 才能把下拉唤出来,直接点外层 div 有时不触发
-            var sizeTrigger = sizeBox.querySelector('.el-input__inner') || sizeBox;
-            clickReal(sizeTrigger);
-            var opened = await waitUntil(function () {
-                var items = document.querySelectorAll('.el-select-dropdown__item, li.el-select-dropdown__item');
-                for (var k = 0; k < items.length; k++) { if (isElementVisible(items[k])) return true; }
-                return false;
-            }, 4000);
-            if (opened) {
-                var items = document.querySelectorAll('.el-select-dropdown__item, li.el-select-dropdown__item');
-                for (var j = 0; j < items.length; j++) {
-                    var t = items[j].textContent.trim();
-                    // 精确匹配 100 那一项(“100条/页”或纯“100”),避免误中 1000 之类
-                    if (isElementVisible(items[j]) && (t === '100' || t === '100条/页' || /^100\s*条\/页$/.test(t))) {
-                        clickReal(items[j]); await sleep(2000); return true;
-                    }
+            await sleepPlain(2000);
+            var res = await fetch('https://cn.noxinfluencer.com/ws/v2/crm/progress', { credentials: 'include' });
+            var d = null; try { d = await res.json(); } catch (e) { d = null; }
+            var list = (d && d.retDataList) || [];
+            var hit = null;
+            for (var i = 0; i < list.length; i++) {
+                if (list[i] && list[i].type === type && list[i].id > baselineId) {
+                    if (!hit || list[i].id > hit.id) hit = list[i];
                 }
             }
+            if (hit) {
+                if (hit.status === 'SUCCESS') return true;
+                if (hit.status === 'FAIL' || hit.status === 'FAILED' || hit.status === 'ERROR') {
+                    throw new Error((label || type) + ' 任务失败(status=' + hit.status + ')');
+                }
+                // 其它状态(RUNNING/PENDING 等)继续等
+                setCrmStatus((label || type) + ' 进行中…(' + hit.status + ')');
+            }
         }
-        setCrmStatus('未找到分页设置,跳过(可能已是100)');
-        return false;
+        throw new Error((label || type) + ' 超时未完成');
     }
-    // 翻到下一页
-    async function crmNextPage() {
-        var nextBtn = document.querySelector('.el-pagination button.btn-next');
-        if (nextBtn && !nextBtn.disabled && isElementVisible(nextBtn)) {
-            clickReal(nextBtn);
-            return true;
-        }
-        return false;
+
+    // 跑单个收藏夹:拉够 cap 人 → 收藏进该夹 → 等成功 → 归档 → 等成功。返回本轮处理人数。
+    async function crmRunOneGroup(group) {
+        var cap = /m/i.test(group.name || '') ? 500 : 1000;
+        setCrmStatus('【' + group.name + '】准备拉取(目标 ' + cap + ' 人)…');
+        var channels = await crmCollectChannels(cap);
+        if (!channels.length) { setCrmStatus('【' + group.name + '】没有可处理的建联中达人'); return 0; }
+
+        // 收藏
+        setCrmStatus('【' + group.name + '】收藏 ' + channels.length + ' 人…');
+        var collectBase = await crmMaxProgressId('collect');
+        await crmPost('/ws/collection/crm/addToCollect', {
+            channels: channels, groupIds: [group.id], selectAll: false, searchParam: CRM_SEARCH_PARAM
+        });
+        await crmWaitProgress('collect', collectBase, '收藏');
+        setCrmStatus('【' + group.name + '】收藏完成,归档中…');
+
+        // 归档(移出建联中)
+        var delBase = await crmMaxProgressId('delete');
+        await crmPost('/ws/crm/batchUpdateChannel', {
+            channels: channels, selectAll: false, searchParam: CRM_SEARCH_PARAM, deleteFlag: 1
+        });
+        await crmWaitProgress('delete', delBase, '归档');
+        setCrmStatus('【' + group.name + '】完成:' + channels.length + ' 人已收藏并归档');
+        return channels.length;
     }
-    async function crmWaitTableReady(timeout) {
-        timeout = timeout || 15000;
-        var start = Date.now();
-        while (Date.now() - start < timeout) {
-            if (crmStop) throw new Error('stopped');
-            var rows = document.querySelectorAll('.el-table__body-wrapper tbody tr, .el-table__row');
-            var sa = getCrmSelectAll();
-            if (rows.length > 0 && sa) { await sleep(600); return true; }
-            await sleep(500);
-        }
-        return false;
-    }
+
     async function crmStart() {
         if (crmRunning) return;
-        var lim = parseInt(crmLimitInput.value, 10);
-        if (isNaN(lim) || lim <= 0) { alert('请输入有效的数字'); return; }
-        crmLimit = lim; crmRunning = true; crmStop = false; crmTotal = 0;
+        if (!crmSelectedGroups.length) { alert('请先勾选要收藏进的收藏夹'); return; }
+        var groups = crmSelectedGroups.slice();
+        crmRunning = true; crmStop = false;
         crmStartBtn.style.display = 'none'; crmStopBtn.style.display = 'block';
-        crmLimitInput.disabled = true;
-        var outcome = 'unknown'; // filter_fail / stopped / empty / done,决定最后弹什么提示,避免一律报“成功”
+        if (crmPrefixInput) crmPrefixInput.disabled = true;
+        var totalDone = 0, groupsDone = 0, outcome = 'done';
         try {
-            var filterOk = await crmApplyFilter();
-            // 不要用笼统的“筛选步骤失败”覆盖掉 crmApplyFilter 里那条具体的失败原因,
-            // 否则每次都只看到“失败”却不知道卡在哪一步。保留原文,只在末尾追加“已停止”。
-            if (!filterOk) {
-                var last = crmStatusEl ? crmStatusEl.textContent : '';
-                setCrmStatus((last ? last : '筛选步骤失败') + ' — 已停止');
-                outcome = 'filter_fail';
-                return;
+            for (var i = 0; i < groups.length; i++) {
+                if (crmStop) { outcome = 'stopped'; break; }
+                setCrmStatus('(' + (i + 1) + '/' + groups.length + ')开始【' + groups[i].name + '】');
+                var n = await crmRunOneGroup(groups[i]);
+                totalDone += n;
+                if (n > 0) groupsDone++;
+                // 某个夹子没人可处理 = 建联中已空,后面的夹子也不会有,提前结束
+                if (n === 0) { outcome = 'empty'; break; }
+                await sleepPlain(800);
             }
-            await crmWaitTableReady();
-            await crmSetPageSize100();
-            var firstReady = await crmWaitTableReady();
-            // 筛选后如果一行都没有,说明“建联中”很可能没真正勾上(或本来就没有建联中的人),
-            // 直接如实告知,而不是继续走完再谎报“完成,共选 0 人”。
-            if (!firstReady || countCrmRows() === 0) {
-                setCrmStatus('筛选后没有数据行,可能“建联中”未选中');
-                outcome = 'empty';
-                return;
-            }
-            while (!crmStop && crmTotal < crmLimit) {
-                var ready = await crmWaitTableReady();
-                if (!ready) { setCrmStatus('表格未就绪,停止'); break; }
-                var sa = getCrmSelectAll();
-                if (sa && !sa.classList.contains('is-checked')) {
-                    clickReal(sa);
-                    await sleep(CHECK_DELAY);
-                }
-                // 优先读网站顶部的权威计数“已选N个网红”(跨页累计的真实值)。
-                // 自己一页页累加会翻倍:el-table 有固定列时每行 checkbox 渲染两遍,一页 100 会数成 200。
-                var authoritative = readCrmSelectedCount();
-                if (authoritative !== null) {
-                    crmTotal = authoritative;
-                } else {
-                    var checked = countCrmChecked();
-                    if (checked > 0) { crmTotal += checked; }
-                }
-                setCrmStatus('已选 ' + crmTotal + ' / ' + crmLimit);
-                if (crmTotal >= crmLimit) break;
-                var hasNext = await crmNextPage();
-                if (!hasNext) { setCrmStatus('已到最后一页'); break; }
-                await sleep(NEXT_PAGE_WAIT_TIME);
-            }
-            outcome = crmStop ? 'stopped' : 'done';
         } catch (e) {
-            console.log('[CRM] ' + e.message);
-            if (e.message === 'stopped') outcome = 'stopped';
+            console.log('[CRM] ' + (e && e.message));
+            outcome = (e && e.message === 'stopped') ? 'stopped' : 'error';
+            if (outcome === 'error') setCrmStatus('出错停止:' + (e && e.message));
         } finally {
             crmRunning = false;
             crmStartBtn.style.display = 'block'; crmStopBtn.style.display = 'none';
-            crmLimitInput.disabled = false;
-            if (outcome === 'filter_fail') {
-                alert('筛选没成功,一个都没选。请把“团队联系状态”下拉展开的样子截图给我。');
+            if (crmPrefixInput) crmPrefixInput.disabled = false;
+            if (outcome === 'stopped') {
+                alert('已手动停止。已完成 ' + groupsDone + ' 个收藏夹,共处理 ' + totalDone + ' 人。');
             } else if (outcome === 'empty') {
-                alert('筛选“建联中”后没有数据行。可能是没勾上,或当前确实没有建联中的达人。');
-            } else if (outcome === 'stopped') {
-                setCrmStatus('已停止,共选 ' + crmTotal + ' 人');
-                alert('已手动停止,共选 ' + crmTotal + ' 人');
+                alert('建联中已没有更多达人。已完成 ' + groupsDone + ' 个收藏夹,共处理 ' + totalDone + ' 人。');
+            } else if (outcome === 'error') {
+                alert('中途出错已停止。已完成 ' + groupsDone + ' 个收藏夹,共处理 ' + totalDone + ' 人。详情见状态栏/控制台。');
             } else {
-                setCrmStatus('完成,共选 ' + crmTotal + ' 人');
-                alert('CRM 全选完成,共选 ' + crmTotal + ' 人');
+                setCrmStatus('全部完成,共处理 ' + totalDone + ' 人');
+                alert('CRM 全自动完成:' + groupsDone + ' 个收藏夹,共 ' + totalDone + ' 人已收藏并归档。');
             }
         }
     }
+
+    // ---- 面板:日期前缀 + 收藏夹勾选(照搬搜索页那套) ----
+    function crmSyncSelectedGroups() {
+        crmSelectedGroups = [];
+        if (!crmGroupSelectEl) return;
+        var cbs = crmGroupSelectEl.querySelectorAll('input[type=checkbox]');
+        for (var i = 0; i < cbs.length; i++) {
+            if (cbs[i].checked && cbs[i]._group) {
+                crmSelectedGroups.push({ id: cbs[i]._group.id, name: cbs[i]._group.name });
+            }
+        }
+    }
+    function crmPopulateGroups(groups) {
+        if (!crmGroupSelectEl) return;
+        var prefix = (crmPrefixInput && crmPrefixInput.value.trim()) || ultraTodayPrefix();
+        // 复用搜索页的挑选逻辑:最近建的、名字以前缀开头、正序(先建先填),并标出 cap。
+        var picked = ultraPickTodayFolders(groups, prefix);
+        crmGroupSelectEl.innerHTML = '';
+        if (!picked.length) {
+            crmGroupSelectEl.innerHTML = '<div style="padding:8px;color:#888;">没有以「' + prefix + '」开头的收藏夹</div>';
+            crmSyncSelectedGroups();
+            return;
+        }
+        picked.forEach(function (g) {
+            var row = document.createElement('label');
+            row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 8px;cursor:pointer;border-bottom:1px solid #f0f0f0;';
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = true; // 默认全选当天的
+            cb._group = { id: g.id, name: g.name };
+            cb.addEventListener('change', crmSyncSelectedGroups);
+            var txt = document.createElement('span');
+            txt.textContent = g.name + '  (' + g.cap + '人)';
+            row.appendChild(cb);
+            row.appendChild(txt);
+            crmGroupSelectEl.appendChild(row);
+        });
+        crmSyncSelectedGroups();
+    }
+    async function crmLoadGroups(force) {
+        if (!crmGroupSelectEl) return;
+        crmGroupSelectEl.innerHTML = '<div style="padding:8px;color:#888;">正在加载收藏夹…</div>';
+        try {
+            var groups = await fetchGroups(force);
+            crmPopulateGroups(groups);
+        } catch (e) {
+            crmGroupSelectEl.innerHTML = '<div style="padding:8px;color:#f44336;">加载失败,点🔄重试</div>';
+            console.log('[CRM] 加载收藏夹失败:', e && e.message);
+        }
+    }
+    function crmSetAllChecks(checked) {
+        if (!crmGroupSelectEl) return;
+        var cbs = crmGroupSelectEl.querySelectorAll('input[type=checkbox]');
+        for (var i = 0; i < cbs.length; i++) cbs[i].checked = checked;
+        crmSyncSelectedGroups();
+    }
     function buildCrmPanel(root) {
-        root.style.width = '210px';
+        root.style.width = '240px';
         var desc = document.createElement('span');
-        desc.innerHTML = '建联中 · 自动全选<br><span style="font-weight:normal;color:#888;font-size:11px;">筛选建联中→100条/页→逐页全选</span>';
-        desc.style.fontSize = '12px';
-        desc.style.fontWeight = 'bold';
-        var lab = document.createElement('span');
-        lab.textContent = '目标数量:';
-        lab.style.fontSize = '12px';
-        crmLimitInput = document.createElement('input');
-        crmLimitInput.type = 'number';
-        crmLimitInput.value = '1000';
-        crmLimitInput.style.padding = '5px';
-        crmLimitInput.style.border = '1px solid #ccc';
-        crmLimitInput.style.borderRadius = '4px';
+        desc.innerHTML = '建联中 · 收藏并归档<br><span style="font-weight:normal;color:#888;font-size:11px;">逐个收藏夹:拉建联中→收藏→归档(纯接口)</span>';
+        desc.style.cssText = 'font-size:12px;font-weight:bold;';
+        // ① 日期前缀
+        var prefixLabel = document.createElement('span');
+        prefixLabel.textContent = '① 日期前缀:';
+        prefixLabel.style.cssText = 'font-size:12px;font-weight:bold;';
+        crmPrefixInput = document.createElement('input');
+        crmPrefixInput.type = 'text';
+        crmPrefixInput.placeholder = '例如 0810';
+        crmPrefixInput.style.cssText = 'padding:5px;border:1px solid #ccc;border-radius:4px;';
+        try { crmPrefixInput.value = localStorage.getItem('nox-crm-prefix') || ultraTodayPrefix(); } catch (e) { crmPrefixInput.value = ultraTodayPrefix(); }
+        crmPrefixInput.addEventListener('input', function () {
+            try { localStorage.setItem('nox-crm-prefix', crmPrefixInput.value); } catch (e) {}
+            if (__noxGroupCache) crmPopulateGroups(__noxGroupCache);
+        });
+        // ② 收藏夹列表 + 刷新
+        var groupLabel = document.createElement('span');
+        groupLabel.innerHTML = '② 今日收藏夹 <span style="font-weight:normal;color:#888;">(默认全选)</span>:';
+        groupLabel.style.cssText = 'font-size:12px;font-weight:bold;';
+        var toolRow = document.createElement('div');
+        toolRow.style.cssText = 'display:flex;gap:10px;font-size:11px;align-items:center;';
+        var selAll = document.createElement('a');
+        selAll.textContent = '全选'; selAll.href = 'javascript:void(0)';
+        selAll.style.cssText = 'color:#4CAF50;text-decoration:none;cursor:pointer;';
+        selAll.addEventListener('click', function () { crmSetAllChecks(true); });
+        var selNone = document.createElement('a');
+        selNone.textContent = '全不选'; selNone.href = 'javascript:void(0)';
+        selNone.style.cssText = 'color:#888;text-decoration:none;cursor:pointer;';
+        selNone.addEventListener('click', function () { crmSetAllChecks(false); });
+        var refreshBtn = document.createElement('a');
+        refreshBtn.textContent = '🔄刷新'; refreshBtn.href = 'javascript:void(0)';
+        refreshBtn.style.cssText = 'color:#607d8b;text-decoration:none;cursor:pointer;margin-left:auto;';
+        refreshBtn.addEventListener('click', function () { crmLoadGroups(true); });
+        toolRow.appendChild(selAll);
+        toolRow.appendChild(selNone);
+        toolRow.appendChild(refreshBtn);
+        crmGroupSelectEl = document.createElement('div');
+        crmGroupSelectEl.style.cssText = 'width:100%;max-height:160px;overflow-y:auto;border:1px solid #ccc;border-radius:4px;font-size:12px;box-sizing:border-box;background:#fff;';
+        // 按钮
         crmStartBtn = document.createElement('button');
-        crmStartBtn.textContent = '开始筛选+全选';
-        crmStartBtn.style.padding = '10px';
-        crmStartBtn.style.backgroundColor = '#4CAF50';
-        crmStartBtn.style.color = 'white';
-        crmStartBtn.style.border = 'none';
-        crmStartBtn.style.borderRadius = '4px';
-        crmStartBtn.style.cursor = 'pointer';
-        crmStartBtn.style.fontWeight = 'bold';
+        crmStartBtn.textContent = '✅ 开始收藏+归档';
+        crmStartBtn.style.cssText = 'padding:10px;background:#4CAF50;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:bold;';
         crmStartBtn.addEventListener('click', crmStart);
         crmStopBtn = document.createElement('button');
         crmStopBtn.textContent = 'Stop';
-        crmStopBtn.style.padding = '8px';
-        crmStopBtn.style.backgroundColor = '#f44336';
-        crmStopBtn.style.color = 'white';
-        crmStopBtn.style.border = 'none';
-        crmStopBtn.style.borderRadius = '4px';
-        crmStopBtn.style.cursor = 'pointer';
-        crmStopBtn.style.display = 'none';
-        crmStopBtn.addEventListener('click', function () { crmStop = true; });
+        crmStopBtn.style.cssText = 'padding:8px;background:#f44336;color:#fff;border:none;border-radius:4px;cursor:pointer;display:none;';
+        crmStopBtn.addEventListener('click', function () { crmStop = true; setCrmStatus('停止中…(完成当前接口后停)'); });
         crmStatusEl = document.createElement('div');
-        crmStatusEl.style.fontSize = '11px';
-        crmStatusEl.style.color = '#555';
-        crmStatusEl.style.marginTop = '4px';
+        crmStatusEl.style.cssText = 'font-size:11px;color:#555;margin-top:4px;';
         crmStatusEl.textContent = '就绪';
         root.appendChild(desc);
-        root.appendChild(lab);
-        root.appendChild(crmLimitInput);
+        root.appendChild(prefixLabel);
+        root.appendChild(crmPrefixInput);
+        root.appendChild(groupLabel);
+        root.appendChild(toolRow);
+        root.appendChild(crmGroupSelectEl);
         root.appendChild(crmStartBtn);
         root.appendChild(crmStopBtn);
         root.appendChild(crmStatusEl);
+        crmLoadGroups(false);
     }
     function ensureUI() {
         if (!isPanelPage()) return; // 非功能页不建面板
