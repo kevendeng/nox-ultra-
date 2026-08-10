@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '2.5-ultra';
+    var SCRIPT_VERSION = '2.6-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -122,6 +122,7 @@
         return document.querySelectorAll('.youtube-channel-item').length > 0;
     }
     // 调收藏接口:一次把本页可见达人加入指定收藏夹。同源 fetch，鉴权靠 cookie 自动带。
+    // 收藏接口原始调用:发一批 id,返回 {status, body}。
     async function collectViaApi(ids, groupIds, platform) {
         var res = await fetch('https://cn.noxinfluencer.com/ws/collection', {
             method: 'PUT',
@@ -132,6 +133,31 @@
         var body = null;
         try { body = await res.json(); } catch (e) { try { body = await res.text(); } catch (e2) { body = null; } }
         return { status: res.status, body: body };
+    }
+    // 带"跳过坏达人"的收藏:先整批试;若整批非200且不止一个 id,就拆成单个逐个收,
+    // 把能收的收进去、跳过报错的那个(Nox 偶发某达人数据异常返回500"系统异常")。
+    // 返回 { okIds:[...成功id], badIds:[...跳过id], fatal:bool, status:最后一次坏状态 }。
+    // fatal=true 表示连单个都全失败(疑似登录失效/整体故障),交由上层暂停。
+    async function collectWithSkip(ids, groupIds, platform) {
+        var first = await collectViaApi(ids, groupIds, platform);
+        if (first.status === 200) return { okIds: ids.slice(), badIds: [], fatal: false, status: 200 };
+        if (ids.length <= 1) {
+            // 单个就失败:这一个是坏达人 -> 跳过(不视为致命,让流程继续)
+            return { okIds: [], badIds: ids.slice(), fatal: false, status: first.status };
+        }
+        // 整批失败且是多个 -> 拆成单个逐个试,定位并跳过坏达人
+        setCollectStatus('整批收藏返回 ' + first.status + ',逐个重试以跳过异常达人…');
+        console.log('[collect] 整批失败(' + first.status + '),拆成单个:' + ids.length + '个');
+        var okIds = [], badIds = [];
+        for (var i = 0; i < ids.length; i++) {
+            var r = await collectViaApi([ids[i]], groupIds, platform);
+            if (r.status === 200) okIds.push(ids[i]);
+            else { badIds.push(ids[i]); console.log('[collect] 跳过异常达人 ' + ids[i] + '(status ' + r.status + ')'); }
+            await sleepPlain(300); // 逐个之间稍等,别太密
+        }
+        // 若一个都没成功,疑似不是脏数据而是登录/整体故障 -> 致命
+        var fatal = okIds.length === 0;
+        return { okIds: okIds, badIds: badIds, fatal: fatal, status: first.status };
     }
     // 处理当前页:等渲染稳 → 抓可见 id(不超过剩余名额) → 调接口收藏。返回本页实际收藏数。
     async function processCurrentPage() {
@@ -144,14 +170,17 @@
         var remaining = maxCheckLimit - totalUsersChecked;
         if (ids.length > remaining) ids = ids.slice(0, remaining);
         setCollectStatus('第' + currentPageNum + '页：收藏 ' + ids.length + ' 个…');
-        var r = await collectViaApi(ids, collectGroupIds, collectPlatform);
-        if (r.status !== 200) {
-            throw new Error('收藏接口返回 ' + r.status + '，已停止。请检查登录状态或收藏夹。');
+        var r = await collectWithSkip(ids, collectGroupIds, collectPlatform);
+        if (r.fatal) {
+            // 逐个都失败 -> 疑似登录失效或平台整体故障,才真正停
+            throw new Error('收藏接口返回 ' + r.status + '（逐个重试仍全失败），已停止。请检查登录状态或收藏夹。');
         }
-        totalUsersChecked += ids.length;
+        var got = r.okIds.length;
+        totalUsersChecked += got;
         updateButtonText();
-        setCollectStatus('已收藏 ' + totalUsersChecked + '/' + maxCheckLimit + '（第' + currentPageNum + '页 +' + ids.length + '）');
-        return ids.length;
+        var skipMsg = r.badIds.length ? '，跳过异常 ' + r.badIds.length + ' 个' : '';
+        setCollectStatus('已收藏 ' + totalUsersChecked + '/' + maxCheckLimit + '（第' + currentPageNum + '页 +' + got + skipMsg + '）');
+        return got;
     }
     async function goToNextPage() {
         var nextPageButton = document.querySelector('.search-pagination-container .right');
@@ -573,19 +602,26 @@
                         if (ids.length > platRoom) ids = ids.slice(0, platRoom);
                     }
                     if (ids.length) {
-                        var r = await collectViaApi(ids, [folder.id], st.platform);
-                        if (r.status !== 200) {
-                            ultraStatus('收藏接口返回 ' + r.status + ',暂停。请检查登录/收藏夹。');
+                        var r = await collectWithSkip(ids, [folder.id], st.platform);
+                        if (r.fatal) {
+                            // 逐个都失败 -> 疑似登录失效或平台整体故障,才暂停
+                            var stat = r.status === 0 ? '网络异常' : ('返回 ' + r.status);
+                            ultraStatus('收藏接口' + stat + '(逐个重试仍全失败),暂停。请检查登录/收藏夹。');
                             st.running = false; ultraSaveState(st);
-                            alert('全自动暂停:收藏接口返回 ' + r.status + '。请检查登录状态后重试。');
+                            alert('全自动暂停:收藏接口' + stat + '。逐个重试仍全失败,像是登录失效或平台故障,请检查后点▶继续。');
                             return;
                         }
-                        folder.filled += ids.length;
-                        st.stats.collected += ids.length;
-                        st.platformCollected += ids.length;
+                        var got = r.okIds.length;
+                        if (r.badIds.length) {
+                            ultraStatus('批' + (st.stats.batches + 1) + ' 收 ' + got + ' 个,跳过异常达人 ' + r.badIds.length + ' 个,继续…');
+                            console.log('[ultra] 跳过异常达人:' + r.badIds.join(','));
+                        }
+                        folder.filled += got;
+                        st.stats.collected += got;
+                        st.platformCollected += got;
                         ultraSaveState(st);
-                        // 记一条批次历史:本批词 -> 收进了哪个收藏夹(累积,可导出)
-                        ultraAppendLog(st.batchWords, ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform), folder.name, ids.length);
+                        // 记一条批次历史:本批词 -> 收进了哪个收藏夹(累积,可导出;记实际成功数)
+                        if (got) ultraAppendLog(st.batchWords, ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform), folder.name, got);
                     }
                 }
                 // 测试模式:本平台已达上限,当作“本平台本批收完”,走切平台逻辑
