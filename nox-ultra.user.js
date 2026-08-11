@@ -1984,7 +1984,7 @@
             cb._group = { id: g.id, name: g.name };
             cb.addEventListener('change', crmSyncSelectedGroups);
             var txt = document.createElement('span');
-            txt.textContent = g.name + '  (已装' + (g.filled != null ? g.filled : '?') + '/上限' + g.cap + ')';
+            txt.textContent = g.name + '  (' + (g.filled != null ? g.filled : '?') + '人)';
             row.appendChild(cb);
             row.appendChild(txt);
             crmGroupSelectEl.appendChild(row);
