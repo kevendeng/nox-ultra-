@@ -1890,8 +1890,15 @@
     // 跑单个收藏夹:拉够 cap 人 → 收藏进该夹 → 等成功 → 归档 → 等成功。返回本轮处理人数。
     async function crmRunOneGroup(group) {
         var cap = /m/i.test(group.name || '') ? 500 : 1000;
-        setCrmStatus('【' + group.name + '】准备拉取(目标 ' + cap + ' 人)…');
-        var channels = await crmCollectChannels(cap);
+        // 实时拉最新收藏夹,算“还需补多少”= 目标上限 - 已装。cap 是填补目标,不是每次固定拉满。
+        var fresh = await fetchGroups(true);
+        var cur = null;
+        for (var gi = 0; gi < fresh.length; gi++) { if (fresh[gi].id === group.id) { cur = fresh[gi]; break; } }
+        var filled = (cur && cur.filled != null) ? cur.filled : 0;
+        var need = cap - filled;
+        if (need <= 0) { setCrmStatus('【' + group.name + '】已满(' + filled + '/' + cap + '),跳过'); return 0; }
+        setCrmStatus('【' + group.name + '】已装 ' + filled + '/' + cap + ',需补 ' + need + ' 人…');
+        var channels = await crmCollectChannels(need);
         if (!channels.length) { setCrmStatus('【' + group.name + '】没有可处理的建联中达人'); return 0; }
 
         // 收藏
