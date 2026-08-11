@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '2.7-ultra';
+    var SCRIPT_VERSION = '2.8-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -1980,7 +1980,7 @@
             row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 8px;cursor:pointer;border-bottom:1px solid #f0f0f0;';
             var cb = document.createElement('input');
             cb.type = 'checkbox';
-            cb.checked = true; // 默认全选当天的
+            cb.checked = (g.cap === 500); // 默认只勾带 M 的夹子(cap=500),其余需手动勾
             cb._group = { id: g.id, name: g.name };
             cb.addEventListener('change', crmSyncSelectedGroups);
             var txt = document.createElement('span');
@@ -2028,7 +2028,7 @@
         });
         // ② 收藏夹列表 + 刷新
         var groupLabel = document.createElement('span');
-        groupLabel.innerHTML = '② 今日收藏夹 <span style="font-weight:normal;color:#888;">(默认全选)</span>:';
+        groupLabel.innerHTML = '② 今日收藏夹 <span style="font-weight:normal;color:#888;">(默认只勾带M)</span>:';
         groupLabel.style.cssText = 'font-size:12px;font-weight:bold;';
         var toolRow = document.createElement('div');
         toolRow.style.cssText = 'display:flex;gap:10px;font-size:11px;align-items:center;';
