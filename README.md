@@ -1,5 +1,7 @@
 # Nox Ultra
 
+### ▶ [点此安装脚本](https://github.com/kevendeng/nox-ultra-/raw/main/nox-ultra.user.js)（需先装 [Tampermonkey](https://www.tampermonkey.net/)，点开自动弹出安装）
+
 一个用于 **NoxInfluencer** 的油猴脚本，把每天重复的达人建联工作（搜索收藏、建收藏夹、发邮件、CRM 归档）做成一键式的可视化面板。
 
 装好后进入 NoxInfluencer 对应页面，右侧会自动浮出操作面板。
