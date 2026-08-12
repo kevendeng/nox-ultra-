@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      3.6
+// @version      3.6.1
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '3.6-ultra';
+    var SCRIPT_VERSION = '3.6.1-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -2088,6 +2088,10 @@
         var d = null;
         try { d = await res.json(); } catch (e) { d = null; }
         if (!res.ok) throw new Error(path + ' HTTP ' + res.status);
+        // 业务层错误:HTTP 200 但 bizErrorCode/errorNum 非空,服务器其实拒了。打出来便于定位。
+        if (d && (d.bizErrorCode || (d.errorNum && d.errorNum !== 0))) {
+            console.log('[CRM] ' + path + ' 业务返回异常:', JSON.stringify(d));
+        }
         return d;
     }
 
@@ -2155,7 +2159,14 @@
             if (hit) {
                 if (hit.status === 'SUCCESS') return true;
                 if (hit.status === 'FAIL' || hit.status === 'FAILED' || hit.status === 'ERROR') {
-                    throw new Error((label || type) + ' 任务失败(status=' + hit.status + ')');
+                    // 把服务器 progress 那条任务的完整字段打出来,便于定位为什么 ERROR
+                    // (常见:failReason/message/failCount/successCount/bizErrorCode 会说明原因)
+                    console.log('[CRM] 任务失败,progress 命中记录:', JSON.stringify(hit));
+                    var reason = hit.failReason || hit.message || hit.errorMsg || hit.remark || '';
+                    var cnts = (hit.successCount != null || hit.failCount != null)
+                        ? ('(成功' + (hit.successCount || 0) + '/失败' + (hit.failCount || 0) + ')') : '';
+                    throw new Error((label || type) + ' 任务失败(status=' + hit.status + ')'
+                        + cnts + (reason ? ' 原因:' + reason : ' —— 详情见控制台 [CRM] 日志'));
                 }
                 // 其它状态(RUNNING/PENDING 等)继续等
                 setCrmStatus((label || type) + ' 进行中…(' + hit.status + ')');
