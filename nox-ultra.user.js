@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.3
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,14 +14,13 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '3.1-ultra';
+    var SCRIPT_VERSION = '3.3-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
     var totalUsersChecked = 0;
     var maxCheckLimit = 1000;
-    var CHECK_DELAY = 800;
-    var NEXT_PAGE_WAIT_TIME = 2500;
+    var NEXT_PAGE_WAIT_TIME = 500; // 翻页后仅给起步缓冲;真正等渲染稳由 waitForCollectPageReady 负责(原 2500 与其重复,是白等)
     function sleep(ms) {
         return new Promise(function (resolve, reject) {
             if (stopRequested) return reject(new Error('stopped'));
@@ -105,6 +104,73 @@
         var seen = {}, out = [];
         for (var j = 0; j < ids.length; j++) { if (!seen[ids[j]]) { seen[ids[j]] = 1; out.push(ids[j]); } }
         return out;
+    }
+    // ==================== 纯接口提速:searchFilter 判灰 ====================
+    // 抓当前页所有卡片(含灰),返回 [{id, gray}]。gray = 带 .youtube-channel-fade。仅自检用。
+    function getAllChannelCards() {
+        var out = [], seen = {};
+        var items = document.querySelectorAll('.youtube-channel-item');
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i];
+            var a = it.querySelector('a[href*="/channel/"]');
+            if (!a) continue;
+            var m = (a.getAttribute('href') || '').match(/\/channel\/([^\/?#]+)/);
+            if (!m) continue;
+            var id = m[1]; if (seen[id]) continue; seen[id] = 1;
+            out.push({ id: id, gray: it.classList.contains('youtube-channel-fade') });
+        }
+        return out;
+    }
+    // 拦截页面自己发的 /ws/searchFilter,存最近一次完整 body 当模板(coopStatus/clearContact/groupIds 等原样复用,不猜含义)。
+    // 只读记录,不改请求。翻页调用时只替换 channelIds + platform。
+    var __noxFilterTpl = null;
+    (function hookSearchFilter() {
+        function grab(url, body) {
+            if (String(url).indexOf('/ws/searchFilter') === -1) return;
+            try { __noxFilterTpl = (typeof body === 'string') ? JSON.parse(body) : body; } catch (e) {}
+        }
+        var of = window.fetch;
+        window.fetch = function (input, init) {
+            var url = (typeof input === 'string') ? input : (input && input.url) || '';
+            grab(url, init && init.body);
+            return of.apply(this, arguments);
+        };
+        var oOpen = XMLHttpRequest.prototype.open, oSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u) { this.__noxU = u; return oOpen.apply(this, arguments); };
+        XMLHttpRequest.prototype.send = function (b) { grab(this.__noxU, b); return oSend.apply(this, arguments); };
+    })();
+    // 调 searchFilter:复用页面参数模板,只换 channelIds + platform。返回 {channelId: true(灰)/false(可收)}。
+    // 无模板 -> 返回 null(调用方据此退回 DOM)。
+    async function callSearchFilter(ids, platform) {
+        if (!__noxFilterTpl) return null;
+        var body = JSON.parse(JSON.stringify(__noxFilterTpl));
+        body.channelIds = ids;
+        if (platform) body.platform = platform;
+        try {
+            var res = await fetch('https://cn.noxinfluencer.com/ws/searchFilter', {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                credentials: 'include', body: JSON.stringify(body)
+            });
+            var j = await res.json();
+            return (j && j.retData) || {};
+        } catch (e) { console.log('[ultra] searchFilter 调用失败:', e && e.message); return null; }
+    }
+    // 首页自检:等 DOM 渲染稳,抓全部卡片(灰+亮),用接口判同一批,逐个比对。
+    // 全一致且接口无漏返 -> ok。任何不一致/漏返/无模板 -> 不 ok(退回 DOM),绝不硬收。
+    async function ultraSelfCheck(platform) {
+        await waitForCollectPageReady();
+        var cards = getAllChannelCards();
+        if (!cards.length) return { ok: false, reason: '本页无卡片', checked: 0 };
+        var ret = await callSearchFilter(cards.map(function (c) { return c.id; }), platform);
+        if (!ret) return { ok: false, reason: '未拿到searchFilter模板(先让页面自己搜一次)', checked: 0 };
+        var mism = 0, missing = 0;
+        for (var i = 0; i < cards.length; i++) {
+            var c = cards[i];
+            if (!(c.id in ret)) { missing++; continue; }
+            if ((ret[c.id] === true) !== c.gray) mism++;
+        }
+        if (mism || missing) return { ok: false, reason: '不一致' + mism + '/漏返' + missing, checked: cards.length };
+        return { ok: true, reason: '', checked: cards.length };
     }
     // 智能等待本页渲染稳定：不仅要有卡片，还要“可见达人数量”连续几次不变，
     // 确保 .youtube-channel-fade(隐藏标记)已经渲染上去——否则会抢在隐藏生效前把建联过的人误当可见。
@@ -581,6 +647,21 @@
         }
         // 本平台本批已收数(测试模式用:到上限就切下一平台)。每次进入 collect(即每个平台)从 0 起。
         if (st.platformCollected == null) { st.platformCollected = 0; ultraSaveState(st); }
+        // ---- 分流:优先纯接口(快);首页用 searchFilter 与 DOM 交叉自检,不一致或无模板则退回稳妥 DOM ----
+        var __tpl = ultraGetTemplateFromUrl();
+        if (__tpl) {
+            var __chk = await ultraSelfCheck(st.platform);
+            if (__chk.ok) {
+                ultraStatus('接口自检通过(核对' + __chk.checked + '个灰/亮与DOM一致),纯接口高速收藏…');
+                return ultraDoCollectApi(st, __tpl);
+            }
+            ultraStatus('接口自检未过(' + __chk.reason + '),本批改用稳妥DOM流程收藏。');
+            console.log('[ultra] 首页自检未过,退回DOM:', __chk.reason);
+        }
+        return ultraDoCollectDom(st);
+    }
+    // 稳妥回退:旧版 DOM 翻页收藏(点"下一页"按钮 + 等渲染)。接口自检不通过 / 无模板时用。
+    async function ultraDoCollectDom(st) {
         var pageNum = 0;
         while (true) {
             // 每轮开头重读状态:用户点“停止”会把 running 置 false / 清空,这里要能立刻退出
@@ -652,6 +733,102 @@
                 return;
             }
             await sleep(NEXT_PAGE_WAIT_TIME);
+        }
+    }
+    // 纯接口收藏:GET search 拿100条+searchAfter游标翻页 → searchFilter 判灰(true跳过)→ 只收 false → PUT collection。
+    // 全程不碰 DOM、不点按钮、不等渲染。页间随机节流防风控。tpl = 当前搜索条件模板(ultraGetTemplateFromUrl)。
+    var API_PAGE_MIN = 600, API_PAGE_MAX = 1200; // 页间节流(ms),随机取值,像"快速点页"的人而非爬虫
+    function apiJitter() { var base = API_PAGE_MIN; return base + ((Date.now() % (API_PAGE_MAX - API_PAGE_MIN))); }
+    // 调 search 接口拿一页。pageNum 从 1 起;searchAfter 为上页最后一条游标(首页传 null)。
+    // 返回 {list:[{id,searchAfter}], totalPage}。失败返回 null(调用方退回 DOM)。
+    async function callSearchApi(tpl, platform, pageNum, searchAfter) {
+        var obj = JSON.parse(JSON.stringify(tpl));
+        obj.pageNum = pageNum;
+        obj.pageSize = 100;
+        if (searchAfter) obj.searchAfter = searchAfter; else delete obj.searchAfter;
+        if (!obj.hideChannelFilter) obj.hideChannelFilter = {};
+        obj.hideChannelFilter.platform = platform;
+        var pathName = ULTRA_PLATFORM_PATH[platform] || 'youtube';
+        var url = location.origin + '/ws/v2/' + pathName + '/star/search?p=' + ultraEncodeP(obj);
+        try {
+            var res = await fetch(url, { credentials: 'include' });
+            var j = await res.json();
+            var arr = (j && j.retDataList) || [];
+            var list = arr.map(function (r) { return { id: String(r.id), searchAfter: r.searchAfter }; });
+            return { list: list, totalPage: (j && j.totalPage) || 0 };
+        } catch (e) { console.log('[ultra] search 接口失败:', e && e.message); return null; }
+    }
+    async function ultraDoCollectApi(st, tpl) {
+        var pageNum = 0;
+        var cursor = null;
+        while (true) {
+            var live = ultraLoadState();
+            if (!live || !live.running) { ultraStatus('已停止。'); return; }
+            // 找还没满的收藏夹
+            while (st.folderIdx < st.folders.length && st.folders[st.folderIdx].filled >= st.folders[st.folderIdx].cap) st.folderIdx++;
+            if (st.folderIdx >= st.folders.length) {
+                ultraStatus('今天的收藏夹全部装满,任务停止。');
+                st.running = false; ultraSaveState(st);
+                alert('全自动停止:今天的收藏夹都装满了(共 ' + st.folders.length + ' 个)。请新建更多收藏夹。');
+                return;
+            }
+            var folder = st.folders[st.folderIdx];
+            pageNum++;
+            ultraStatus('批' + (st.stats.batches + 1) + ' [接口] 收进 [' + folder.name + '] ' + folder.filled + '/' + folder.cap + ',第' + pageNum + '页…');
+            // 1. 拿一页
+            var page = await callSearchApi(tpl, st.platform, pageNum, cursor);
+            if (!page) { ultraStatus('search 接口异常,本批改用DOM流程。'); return ultraDoCollectDom(st); }
+            if (!page.list.length) {
+                ultraStatus('批' + (st.stats.batches + 1) + ' 在 ' + (ULTRA_PLATFORM_NAME[st.platform] || st.platform) + ' 接口无更多结果,切换。');
+                await ultraAdvancePlatformOrBatch(st); return;
+            }
+            cursor = page.list[page.list.length - 1].searchAfter; // 记游标供下页
+            // 2. 判灰:searchFilter。true=灰跳过,false=可收
+            var allIds = page.list.map(function (r) { return r.id; });
+            var flag = await callSearchFilter(allIds, st.platform);
+            if (!flag) { ultraStatus('searchFilter 异常,本批改用DOM流程。'); return ultraDoCollectDom(st); }
+            var ids = allIds.filter(function (id) { return flag[id] === false; });
+            var grayN = allIds.length - ids.length;
+            // 3. 名额裁剪(收藏夹剩余 / 测试上限)
+            var room = folder.cap - folder.filled;
+            if (ids.length > room) ids = ids.slice(0, room);
+            if (ULTRA_PER_PLATFORM_LIMIT > 0) {
+                var platRoom = ULTRA_PER_PLATFORM_LIMIT - st.platformCollected;
+                if (ids.length > platRoom) ids = ids.slice(0, platRoom);
+            }
+            // 4. 收藏(沿用 collectWithSkip 跳过坏达人)
+            if (ids.length) {
+                var r = await collectWithSkip(ids, [folder.id], st.platform);
+                if (r.fatal) {
+                    var stat = r.status === 0 ? '网络异常' : ('返回 ' + r.status);
+                    ultraStatus('收藏接口' + stat + '(逐个重试仍全失败),暂停。请检查登录/收藏夹。');
+                    st.running = false; ultraSaveState(st);
+                    alert('全自动暂停:收藏接口' + stat + '。逐个重试仍全失败,像是登录失效或平台故障,请检查后点▶继续。');
+                    return;
+                }
+                var got = r.okIds.length;
+                st.stats.collected += got;
+                st.platformCollected += got;
+                var realFilled = await fetchGroupFilled(folder.id);
+                folder.filled = (realFilled != null) ? realFilled : (folder.filled + got);
+                ultraSaveState(st);
+                var skipMsg = r.badIds.length ? (',跳过异常 ' + r.badIds.length) : '';
+                ultraStatus('批' + (st.stats.batches + 1) + ' [接口] 第' + pageNum + '页 +' + got + '(灰跳过 ' + grayN + skipMsg + '),累计 ' + st.stats.collected);
+                if (got) ultraAppendLog(st.batchWords, ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform), folder.name, got);
+            } else {
+                ultraStatus('批' + (st.stats.batches + 1) + ' [接口] 第' + pageNum + '页无可收(灰跳过 ' + grayN + '),继续…');
+            }
+            // 测试模式到上限:切平台
+            if (ULTRA_PER_PLATFORM_LIMIT > 0 && st.platformCollected >= ULTRA_PER_PLATFORM_LIMIT) {
+                ultraStatus('批' + (st.stats.batches + 1) + ' 在 ' + (ULTRA_PLATFORM_NAME[st.platform] || st.platform) + ' 已收满 ' + ULTRA_PER_PLATFORM_LIMIT + ' 个(测试上限)。');
+                await ultraAdvancePlatformOrBatch(st); return;
+            }
+            // 翻到最后一页:切平台
+            if (page.totalPage && pageNum >= page.totalPage) {
+                ultraStatus('批' + (st.stats.batches + 1) + ' 在 ' + (ULTRA_PLATFORM_NAME[st.platform] || st.platform) + ' 已到最后一页(共' + page.totalPage + '页)。');
+                await ultraAdvancePlatformOrBatch(st); return;
+            }
+            await sleep(apiJitter()); // 页间节流
         }
     }
     // 当前平台本批收完(到平台上限 / 翻到最后一页):切下一平台;三平台都完了就进下一批词。
