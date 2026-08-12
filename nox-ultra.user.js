@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '3.0-ultra';
+    var SCRIPT_VERSION = '3.1-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -75,6 +75,16 @@
         }).sort(function (a, b) { return (b.createTime || 0) - (a.createTime || 0); });
         __noxGroupCache = arr;
         return arr;
+    }
+    // 查某个收藏夹的服务器真实“已装人数”。用于收藏后校准:
+    // Nox 批量收藏接口对“已在夹中/已建联”的达人也返回 200,乐观累加会虚高、导致提前判满跳夹。
+    // 这里强制重拉,以服务器 filled 为准。查不到返回 null(调用方保留原值)。
+    async function fetchGroupFilled(id) {
+        var arr = await fetchGroups(true);
+        for (var i = 0; i < arr.length; i++) {
+            if (arr[i].id === id) return arr[i].filled;
+        }
+        return null;
     }
     // 只抓“可见”达人的 channelId。被隐藏(建联过/已合作)的达人带 .youtube-channel-fade，一律排除。
     // 再叠加 offsetParent 判断作双保险。channelId 从卡片里 /channel/<id> 链接抠出。
@@ -616,9 +626,11 @@
                             ultraStatus('批' + (st.stats.batches + 1) + ' 收 ' + got + ' 个,跳过异常达人 ' + r.badIds.length + ' 个,继续…');
                             console.log('[ultra] 跳过异常达人:' + r.badIds.join(','));
                         }
-                        folder.filled += got;
                         st.stats.collected += got;
                         st.platformCollected += got;
+                        // 用服务器真实“已装人数”校准,别乐观累加(重复达人接口也返回200,会虚高→提前判满跳夹)
+                        var realFilled = await fetchGroupFilled(folder.id);
+                        folder.filled = (realFilled != null) ? realFilled : (folder.filled + got);
                         ultraSaveState(st);
                         // 记一条批次历史:本批词 -> 收进了哪个收藏夹(累积,可导出;记实际成功数)
                         if (got) ultraAppendLog(st.batchWords, ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform), folder.name, got);
