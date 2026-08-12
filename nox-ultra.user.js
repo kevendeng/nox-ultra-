@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      3.4
+// @version      3.5
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '3.4-ultra';
+    var SCRIPT_VERSION = '3.5-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -124,8 +124,33 @@
     // 拦截页面自己发的 /ws/searchFilter,存最近一次完整 body 当模板(coopStatus/clearContact/groupIds 等原样复用,不猜含义)。
     // 只读记录,不改请求。翻页调用时只替换 channelIds + platform。
     var __noxFilterTpl = null;
+    // 页面真实 search 请求模板(解好的对象)。翻页时抄它、只改 pageNum+searchAfter,
+    // 比从 URL 解 p 更可靠(实测:自己解URL拼请求会因字段/游标不齐而翻偏)。
+    var __noxSearchTpl = null;
+    // 判定一个解出的 p 对象是否"真·关键词搜索翻页"模板:
+    // 必须有 pageNum/pageSize(翻页请求特征)。
+    // 用 searchSize/channelIds 排除"相似网红(lookalike)"——它同走 star/search 路径、也带 operator,
+    // 但用一批种子 channelIds 找相似、没有 pageNum,拿它拼请求只返回 totalPage=1、漏掉绝大多数人。
+    // 注意:真·搜索请求本身也带 operator 字段,所以【不能】用 operator 来排除。
+    function ultraIsRealSearchTpl(o) {
+        return !!o && (o.pageNum !== undefined || o.pageSize !== undefined)
+            && o.searchSize === undefined && o.channelIds === undefined;
+    }
     (function hookSearchFilter() {
+        function grabSearchP(url) {
+            // 命中 /ws/v2/<平台>/star/search?p=...,解出请求对象存模板。
+            // 只认"真·关键词搜索翻页":必须有 pageNum/pageSize;排除相似网红(lookalike)——
+            // 它同走 star/search 路径,但带 operator/searchSize/channelIds、无 pageNum,用它拼请求会 totalPage=1 只出1页。
+            if (!/\/ws\/v2\/[^\/]+\/star\/search/.test(String(url))) return;
+            var m = String(url).match(/[?&]p=([^&]+)/);
+            if (!m) return;
+            try {
+                var o = ultraDecodeP(m[1]);
+                if (ultraIsRealSearchTpl(o)) __noxSearchTpl = o;
+            } catch (e) {}
+        }
         function grab(url, body) {
+            grabSearchP(url);
             if (String(url).indexOf('/ws/searchFilter') === -1) return;
             try { __noxFilterTpl = (typeof body === 'string') ? JSON.parse(body) : body; } catch (e) {}
         }
@@ -648,7 +673,15 @@
         // 本平台本批已收数(测试模式用:到上限就切下一平台)。每次进入 collect(即每个平台)从 0 起。
         if (st.platformCollected == null) { st.platformCollected = 0; ultraSaveState(st); }
         // ---- 分流:优先纯接口(快);首页用 searchFilter 与 DOM 交叉自检,不一致或无模板则退回稳妥 DOM ----
-        var __tpl = ultraGetTemplateFromUrl();
+        // 模板优先用 hook 到的"页面真实 search 翻页请求对象"(字段最全、和页面完全一致);
+        // 没抓到再退回从 URL 解 p。实测:从 URL 解出的 p 缺字段会导致翻页拿错人。
+        // 关键:模板必须是"真·翻页搜索"(有 pageNum/pageSize、无 lookalike 的 operator/searchSize),
+        // 否则用它拼接口会 totalPage=1 只出1页、漏掉绝大多数人。不合格一律走 DOM。
+        var __tpl = __noxSearchTpl;
+        if (!ultraIsRealSearchTpl(__tpl)) {
+            var __urlTpl = ultraGetTemplateFromUrl();
+            __tpl = ultraIsRealSearchTpl(__urlTpl) ? __urlTpl : null;
+        }
         if (__tpl) {
             var __chk = await ultraSelfCheck(st.platform);
             if (__chk.ok) {
@@ -657,6 +690,8 @@
             }
             ultraStatus('接口自检未过(' + __chk.reason + '),本批改用稳妥DOM流程收藏。');
             console.log('[ultra] 首页自检未过,退回DOM:', __chk.reason);
+        } else {
+            ultraStatus('未抓到有效搜索翻页模板(先让页面翻一次页),本批用稳妥DOM流程。');
         }
         return ultraDoCollectDom(st);
     }
@@ -741,11 +776,20 @@
     function apiJitter() { var base = API_PAGE_MIN; return base + ((Date.now() % (API_PAGE_MAX - API_PAGE_MIN))); }
     // 调 search 接口拿一页。pageNum 从 1 起;searchAfter 为上页最后一条游标(首页传 null)。
     // 返回 {list:[{id,searchAfter}], totalPage}。失败返回 null(调用方退回 DOM)。
+    // 游标规整:页面请求里 searchAfter 是字符串 "分数,id",但响应里每条给的是数组 [分数, id]。
+    // 必须转成页面用的字符串格式再回传,否则接口忽略它、回退默认排序,翻出另一批人(实测已验证)。
+    function ultraCursorToStr(sa) {
+        if (sa == null) return null;
+        if (typeof sa === 'string') return sa;
+        if (Array.isArray(sa)) return sa.join(',');
+        return null;
+    }
     async function callSearchApi(tpl, platform, pageNum, searchAfter) {
         var obj = JSON.parse(JSON.stringify(tpl));
         obj.pageNum = pageNum;
         obj.pageSize = 100;
-        if (searchAfter) obj.searchAfter = searchAfter; else delete obj.searchAfter;
+        var saStr = ultraCursorToStr(searchAfter);
+        if (saStr) obj.searchAfter = saStr; else delete obj.searchAfter;
         if (!obj.hideChannelFilter) obj.hideChannelFilter = {};
         obj.hideChannelFilter.platform = platform;
         var pathName = ULTRA_PLATFORM_PATH[platform] || 'youtube';
@@ -754,13 +798,16 @@
             var res = await fetch(url, { credentials: 'include' });
             var j = await res.json();
             var arr = (j && j.retDataList) || [];
-            var list = arr.map(function (r) { return { id: String(r.id), searchAfter: r.searchAfter }; });
+            // 存成字符串游标,和页面请求格式一致
+            var list = arr.map(function (r) { return { id: String(r.id), searchAfter: ultraCursorToStr(r.searchAfter) }; });
             return { list: list, totalPage: (j && j.totalPage) || 0 };
         } catch (e) { console.log('[ultra] search 接口失败:', e && e.message); return null; }
     }
     async function ultraDoCollectApi(st, tpl) {
         var pageNum = 0;
         var cursor = null;
+        var prevFirstId = null;       // 上一页首个 id,用于识别"翻页没推进"
+        var prevCursor = null;        // 上一页用的游标,识别游标没变
         while (true) {
             var live = ultraLoadState();
             if (!live || !live.running) { ultraStatus('已停止。'); return; }
@@ -782,6 +829,16 @@
                 ultraStatus('批' + (st.stats.batches + 1) + ' 在 ' + (ULTRA_PLATFORM_NAME[st.platform] || st.platform) + ' 接口无更多结果,切换。');
                 await ultraAdvancePlatformOrBatch(st); return;
             }
+            // ★ 防卡死/防重复:若本页首个 id 和上一页相同,说明翻页没推进(游标失效),
+            //   为避免反复收同一批人,立刻退回稳妥 DOM 流程,绝不硬翻。
+            var curFirstId = page.list[0] && page.list[0].id;
+            if (pageNum > 1 && curFirstId && curFirstId === prevFirstId) {
+                ultraStatus('接口翻页疑似未推进(第' + pageNum + '页与上页重复),改用稳妥DOM流程。');
+                console.log('[ultra] 接口翻页首个id与上页相同,退回DOM。cursor=', prevCursor);
+                return ultraDoCollectDom(st);
+            }
+            prevFirstId = curFirstId;
+            prevCursor = cursor;
             cursor = page.list[page.list.length - 1].searchAfter; // 记游标供下页
             // 2. 判灰:searchFilter。true=灰跳过,false=可收
             var allIds = page.list.map(function (r) { return r.id; });
