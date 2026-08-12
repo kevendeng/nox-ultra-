@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      3.3
+// @version      3.4
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '3.3-ultra';
+    var SCRIPT_VERSION = '3.4-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -897,7 +897,23 @@
         ultraClearState();
         ultraStatus('已停止并清理。');
     }
-    // ULTRA_PLACEHOLDER
+    // 在新标签打开脚本此刻正在抓的那一页(看板标签,只看不跑)。
+    // 用 state 的 template/当前批词/当前平台重建搜索 URL,尾部加 #noxview 让新标签不接管任务。
+    // 原标签的接口循环继续跑,游标/进度不受影响。
+    function ultraOpenCurrentView() {
+        var st = ultraLoadState();
+        if (!st || !st.batchWords || !st.batchWords.length) {
+            alert('还没有正在进行的全自动任务(或还没定好本批词)。等它开始收藏后再点。');
+            return;
+        }
+        var url;
+        try { url = ultraBuildUrl(st.template, st.batchWords, st.platform); }
+        catch (e) { alert('重建当前抓取页URL失败:' + (e && e.message)); return; }
+        url += (url.indexOf('#') === -1 ? '#noxview' : '&noxview');
+        var plat = ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform);
+        ultraStatus('已在新标签打开当前抓取页:' + plat + ' [' + st.batchWords.join(' + ') + '](只看不影响任务)');
+        window.open(url, '_blank');
+    }
     var kwSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
     function getKwInput() {
         return document.querySelector('input.search-value-input')
@@ -1371,6 +1387,14 @@
         ultraResumeBtn.addEventListener('click', function () { resumeUltra(); });
         ultraPauseRow.appendChild(ultraPauseBtn);
         ultraPauseRow.appendChild(ultraResumeBtn);
+        // 查看当前抓取页:纯接口模式下浏览器停在原地,任务在后台翻页。这个按钮开一个「看板标签」
+        // (URL 带 #noxview,只展示不接管任务),让用户亲眼看脚本此刻在收哪批/哪平台的人。
+        // 原标签继续跑接口循环,游标/进度不受影响。
+        var ultraViewBtn = document.createElement('button');
+        ultraViewBtn.textContent = '👁 查看当前抓取页(新标签)';
+        ultraViewBtn.title = '在新标签打开脚本此刻正在收的那一页,只看不跑,不影响任务';
+        ultraViewBtn.style.cssText = 'padding:8px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;';
+        ultraViewBtn.addEventListener('click', ultraOpenCurrentView);
         // 彻底结束并清理(不可继续),做成不显眼的小链接,避免误点丢进度
         var ultraStopBtn = document.createElement('a');
         ultraStopBtn.textContent = '结束并清理进度';
@@ -1482,6 +1506,7 @@
         root.appendChild(ultraBtn);
         root.appendChild(ultraConfirmBtn);
         root.appendChild(ultraPauseRow);
+        root.appendChild(ultraViewBtn);
         root.appendChild(ultraStopBtn);
         root.appendChild(ultraLogBtn);
         root.appendChild(ultraLogMetaRow);
@@ -2278,6 +2303,12 @@
     //  - 任务进行中的正常重载(翻页/跳新词URL):状态是刚存的(60秒内)→ 无声续跑
     //  - 旧的残留状态(关了浏览器过一阵、或上次没停干净):状态陈旧 → 先弹确认,别闷头自己跑
     function ultraAutoResume() {
+        // 「查看当前抓取页」用 window.open 开的看板标签:URL 带 #noxview 标记。
+        // 这类标签只用来看页面上的达人长什么样,绝不接管任务(否则两个标签抢同一任务 → 重复收藏/抢游标)。
+        if (location.hash.indexOf('noxview') !== -1) {
+            console.log('[ultra] 看板标签(#noxview):仅展示,不接管任务。');
+            return;
+        }
         var st = ultraLoadState();
         if (!st || !st.running) return;
         // 收藏夹/邮件邀请/CRM 页:用户是主动切过去干活的,别把人跳回搜索页打断。
