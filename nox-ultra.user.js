@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      3.5
+// @version      3.6
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '3.5-ultra';
+    var SCRIPT_VERSION = '3.6-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -373,12 +373,16 @@
     // 每个平台最多收多少个达人就切下一个(设为 0 表示不限,收满整批直到翻完最后一页或收藏夹满)。
     // >0 为测试模式:每平台只收这么多、且 probe 单词即定批,用于快速验证三平台抓取。
     var ULTRA_PER_PLATFORM_LIMIT = 0;
-    function ultraBuildUrl(template, words, platform) {
+    // pageNum 可选:传入则覆盖模板里的页码(用于"查看当前抓取页"打开脚本实际在收的那一页)。
+    // 纯接口翻页靠游标(searchAfter),仅凭 pageNum 打开的页面未必和接口取到的完全一致,
+    // 但作为"看板"给人肉眼参考已足够;不传时保持原行为(用模板页码)。
+    function ultraBuildUrl(template, words, platform, pageNum) {
         var obj = JSON.parse(JSON.stringify(template));
         var excludes = (obj.wordsList || []).filter(function (w) { return w.exclude === 1; });
         obj.wordsList = words.map(function (v) { return ultraMakeWord(v, 0); }).concat(excludes);
         if (!obj.hideChannelFilter) obj.hideChannelFilter = {};
         obj.hideChannelFilter.platform = platform;
+        if (pageNum && pageNum > 0) { obj.pageNum = pageNum; delete obj.searchAfter; }
         var pathName = ULTRA_PLATFORM_PATH[platform] || 'youtube';
         return location.origin + '/search/' + pathName + '/channel?p=' + ultraEncodeP(obj);
     }
@@ -821,6 +825,7 @@
             }
             var folder = st.folders[st.folderIdx];
             pageNum++;
+            st.livePageNum = pageNum; ultraSaveState(st);   // 存实时页码,供"查看当前抓取页"打开正确页
             ultraStatus('批' + (st.stats.batches + 1) + ' [接口] 收进 [' + folder.name + '] ' + folder.filled + '/' + folder.cap + ',第' + pageNum + '页…');
             // 1. 拿一页
             var page = await callSearchApi(tpl, st.platform, pageNum, cursor);
@@ -963,12 +968,13 @@
             alert('还没有正在进行的全自动任务(或还没定好本批词)。等它开始收藏后再点。');
             return;
         }
+        var pageNum = st.livePageNum || 1;
         var url;
-        try { url = ultraBuildUrl(st.template, st.batchWords, st.platform); }
+        try { url = ultraBuildUrl(st.template, st.batchWords, st.platform, pageNum); }
         catch (e) { alert('重建当前抓取页URL失败:' + (e && e.message)); return; }
         url += (url.indexOf('#') === -1 ? '#noxview' : '&noxview');
         var plat = ULTRA_PLATFORM_NAME[st.platform] || ('平台' + st.platform);
-        ultraStatus('已在新标签打开当前抓取页:' + plat + ' [' + st.batchWords.join(' + ') + '](只看不影响任务)');
+        ultraStatus('已在新标签打开当前抓取页:' + plat + ' 第' + pageNum + '页 [' + st.batchWords.join(' + ') + '](只看不影响任务)');
         window.open(url, '_blank');
     }
     var kwSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
