@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      3.6.2
+// @version      3.6.3
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '3.6.2-ultra';
+    var SCRIPT_VERSION = '3.6.3-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -84,6 +84,27 @@
             if (arr[i].id === id) return arr[i].filled;
         }
         return null;
+    }
+    // 从头找第一个「没满」的收藏夹下标,永远优先补最靠前的空缺(不撒零头、也不落下前面没填满的夹)。
+    // 找不到(疑似全满)时,强制重拉一次服务器真实人数复核 filled,把 in-memory 虚高值(如 975 被当 1000)纠正回来,
+    // 复核后仍全满才返回越界(st.folders.length),让调用方据此报「全部装满」。
+    async function ultraFirstUnfilledIdx(st) {
+        for (var i = 0; i < st.folders.length; i++) {
+            if (st.folders[i].filled < st.folders[i].cap) return i;
+        }
+        // 疑似全满 —— 强制以服务器真实人数复核后再判
+        var fresh = await fetchGroups(true);
+        var byId = {};
+        for (var j = 0; j < fresh.length; j++) byId[fresh[j].id] = fresh[j].filled;
+        for (var k = 0; k < st.folders.length; k++) {
+            var real = byId[st.folders[k].id];
+            if (real != null) st.folders[k].filled = real; // 用服务器真值纠偏
+            if (st.folders[k].filled < st.folders[k].cap) {
+                console.log('[ultra-diag] 复核纠偏:夹[' + st.folders[k].name + '] 实际 ' + st.folders[k].filled + '/' + st.folders[k].cap + ',未满,继续填。');
+                return k;
+            }
+        }
+        return st.folders.length; // 复核后确实全满
     }
     // 只抓“可见”达人的 channelId。被隐藏(建联过/已合作)的达人带 .youtube-channel-fade，一律排除。
     // 再叠加 offsetParent 判断作双保险。channelId 从卡片里 /channel/<id> 链接抠出。
@@ -673,10 +694,8 @@
                 alert('全自动停止:没有以 "' + st.prefix + '" 开头的收藏夹。请先建好当天收藏夹再重试。');
                 return;
             }
-            // folderIdx 跨批保留:首批(undefined)才置 0,之后接着上一批停住的夹续填,不回头撒零头。
-            // 收藏夹按创建时间正序、每批同一 folderIds 过滤,顺序稳定,idx 语义在批间一致。
-            if (st.folderIdx == null) st.folderIdx = 0;
-            if (st.folderIdx >= st.folders.length) st.folderIdx = st.folders.length - 1;
+            // folderIdx 每轮由 ultraFirstUnfilledIdx 从头重算(优先补最靠前的空缺),这里只需给个合法初值。
+            st.folderIdx = 0;
             ultraSaveState(st);
         }
         // 本平台本批已收数(测试模式用:到上限就切下一平台)。每次进入 collect(即每个平台)从 0 起。
@@ -711,10 +730,8 @@
             // 每轮开头重读状态:用户点“停止”会把 running 置 false / 清空,这里要能立刻退出
             var live = ultraLoadState();
             if (!live || !live.running) { ultraStatus('已停止。'); return; }
-            // 找到还没满的收藏夹
-            while (st.folderIdx < st.folders.length && st.folders[st.folderIdx].filled >= st.folders[st.folderIdx].cap) {
-                st.folderIdx++;
-            }
+            // 每轮从头找第一个没满的夹(优先补最靠前的空缺,不落下没填满的夹)。
+            st.folderIdx = await ultraFirstUnfilledIdx(st);
             if (st.folderIdx >= st.folders.length) {
                 ultraStatus('今天的收藏夹全部装满,任务停止。');
                 st.running = false; ultraSaveState(st);
@@ -824,8 +841,8 @@
         while (true) {
             var live = ultraLoadState();
             if (!live || !live.running) { ultraStatus('已停止。'); return; }
-            // 找还没满的收藏夹
-            while (st.folderIdx < st.folders.length && st.folders[st.folderIdx].filled >= st.folders[st.folderIdx].cap) st.folderIdx++;
+            // 每轮从头找第一个没满的夹(优先补最靠前的空缺,不落下 32/33 这类没填满的夹)。
+            st.folderIdx = await ultraFirstUnfilledIdx(st);
             if (st.folderIdx >= st.folders.length) {
                 ultraStatus('今天的收藏夹全部装满,任务停止。');
                 st.running = false; ultraSaveState(st);
