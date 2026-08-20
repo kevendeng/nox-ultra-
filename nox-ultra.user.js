@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NoxInfluencer Ultra (Auto)
 // @namespace    http://tampermonkey.net/
-// @version      3.6.1
+// @version      3.6.2
 // @description  全局自动化:输入关键词→自动跨平台搜索→自动收藏进当天收藏夹(满了换下一个)。CRM 页改为纯接口:逐个收藏夹拉建联中→收藏→归档。含旧版全部功能。
 // @match        https://cn.noxinfluencer.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     // 统一版本号:以后升级只改这一处(以及头部 @version),面板标题/日志会自动跟着变,
     // 避免出现“头部 8.6、面板还写 8.5”这种对不上的情况。
-    var SCRIPT_VERSION = '3.6.1-ultra';
+    var SCRIPT_VERSION = '3.6.2-ultra';
     console.log('Nox Ultra V' + SCRIPT_VERSION + ' started');
     var isScriptRunning = false;
     var stopRequested = false;
@@ -635,7 +635,8 @@
         }
         if (count == null) {
             ultraStatus('读不到结果数,按“够一批”处理,进入收藏');
-            st.phase = 'collect'; st.folders = null; st.folderIdx = 0; st.platformCollected = 0; ultraSaveState(st);
+            // folders 置 null 触发下一批重拉(刷新 filled);folderIdx 不归零 —— 跨批续填,新达人补上一批没填满的夹尾,不从头撒零头
+            st.phase = 'collect'; st.folders = null; st.platformCollected = 0; ultraSaveState(st);
             return ultraDoCollect(st);
         }
         ultraStatus('当前批 [' + st.batchWords.join(' + ') + '] 结果约 ' + count + ' 条');
@@ -647,8 +648,8 @@
             if (st.batchWords.length >= maxWords && count < st.target) {
                 ultraStatus('已达搜索框 ' + maxWords + ' 词上限,直接定批收藏');
             }
-            // 定批,进入收藏
-            st.phase = 'collect'; st.folders = null; st.folderIdx = 0; st.platformCollected = 0; ultraSaveState(st);
+            // 定批,进入收藏。folderIdx 不归零(见上),跨批从上一批停住的夹继续填
+            st.phase = 'collect'; st.folders = null; st.platformCollected = 0; ultraSaveState(st);
             await sleepPlain(600);
             return ultraDoCollect(st);
         }
@@ -665,14 +666,18 @@
         if (!st.folders) {
             var groups = await fetchGroups(true);
             st.folders = ultraPickTodayFolders(groups, st.prefix, st.folderIds);
-            st.folderIdx = 0;
-            ultraSaveState(st);
             if (!st.folders.length) {
+                st.folderIdx = 0; ultraSaveState(st);
                 ultraStatus('没有以 "' + st.prefix + '" 开头的收藏夹,任务停止。请先新建当天收藏夹。');
                 st.running = false; ultraSaveState(st);
                 alert('全自动停止:没有以 "' + st.prefix + '" 开头的收藏夹。请先建好当天收藏夹再重试。');
                 return;
             }
+            // folderIdx 跨批保留:首批(undefined)才置 0,之后接着上一批停住的夹续填,不回头撒零头。
+            // 收藏夹按创建时间正序、每批同一 folderIds 过滤,顺序稳定,idx 语义在批间一致。
+            if (st.folderIdx == null) st.folderIdx = 0;
+            if (st.folderIdx >= st.folders.length) st.folderIdx = st.folders.length - 1;
+            ultraSaveState(st);
         }
         // 本平台本批已收数(测试模式用:到上限就切下一平台)。每次进入 collect(即每个平台)从 0 起。
         if (st.platformCollected == null) { st.platformCollected = 0; ultraSaveState(st); }
@@ -725,6 +730,8 @@
                 var ids = getVisibleChannelIds();
                 if (ids.length) {
                     var room = folder.cap - folder.filled;
+                    // [诊断 v3.6.2] DOM路径 收藏前:夹归属与名额(同接口路径,零头排查用)
+                    console.log('[ultra-diag/DOM] 批' + (st.stats.batches + 1) + ' idx=' + st.folderIdx + ' 夹[' + folder.name + '] filled=' + folder.filled + '/' + folder.cap + ' room=' + room + ' 本页可见=' + ids.length + ' 词=' + st.batchWords.join('+'));
                     if (ids.length > room) ids = ids.slice(0, room);
                     // 测试模式:本平台最多收 ULTRA_PER_PLATFORM_LIMIT 个
                     if (ULTRA_PER_PLATFORM_LIMIT > 0) {
@@ -750,6 +757,8 @@
                         st.platformCollected += got;
                         // 用服务器真实“已装人数”校准,别乐观累加(重复达人接口也返回200,会虚高→提前判满跳夹)
                         var realFilled = await fetchGroupFilled(folder.id);
+                        // [诊断 v3.6.2] DOM路径 收藏后:实收与重拉真实 filled(同接口路径)
+                        console.log('[ultra-diag/DOM] 收后 夹[' + folder.name + '] got=' + got + ' realFilled=' + realFilled + ' 乐观值=' + (folder.filled + got));
                         folder.filled = (realFilled != null) ? realFilled : (folder.filled + got);
                         ultraSaveState(st);
                         // 记一条批次历史:本批词 -> 收进了哪个收藏夹(累积,可导出;记实际成功数)
@@ -853,6 +862,8 @@
             var grayN = allIds.length - ids.length;
             // 3. 名额裁剪(收藏夹剩余 / 测试上限)
             var room = folder.cap - folder.filled;
+            // [诊断 v3.6.2] 收藏前:夹归属与名额。零头问题排查用——若 filled 已到 cap 而 room 仍 >0 或 idx 反复回到已满夹,即 filled 不同步。
+            console.log('[ultra-diag] 批' + (st.stats.batches + 1) + ' idx=' + st.folderIdx + ' 夹[' + folder.name + '] filled=' + folder.filled + '/' + folder.cap + ' room=' + room + ' 本页可收(非灰)=' + ids.length + ' 词=' + st.batchWords.join('+'));
             if (ids.length > room) ids = ids.slice(0, room);
             if (ULTRA_PER_PLATFORM_LIMIT > 0) {
                 var platRoom = ULTRA_PER_PLATFORM_LIMIT - st.platformCollected;
@@ -872,6 +883,8 @@
                 st.stats.collected += got;
                 st.platformCollected += got;
                 var realFilled = await fetchGroupFilled(folder.id);
+                // [诊断 v3.6.2] 收藏后:实收 got 与服务器重拉的真实 filled。若 got>0 但 realFilled 不随之增长(或明显低于乐观值),即为 filled 同步失真 —— 零头真凶。
+                console.log('[ultra-diag] 收后 夹[' + folder.name + '] got=' + got + ' realFilled=' + realFilled + ' 乐观值=' + (folder.filled + got));
                 folder.filled = (realFilled != null) ? realFilled : (folder.filled + got);
                 ultraSaveState(st);
                 var skipMsg = r.badIds.length ? (',跳过异常 ' + r.badIds.length) : '';
